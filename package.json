@@ -1,0 +1,9 @@
+{
+  "name": "spen-wa-webhook",
+  "version": "1.0.0",
+  "description": "SPEN WhatsApp webhook handler",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}

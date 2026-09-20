@@ -7,7 +7,9 @@ app.use(express.json({ limit: '10mb' }));
 const CLICKUP_API = "https://api.clickup.com/api/v2";
 const CLICKUP_TOKEN = process.env.CLICKUP_API_TOKEN;
 const LIST_ID = process.env.CLICKUP_LIST_ID || "901821823676";
+const TEAM_ID = process.env.CLICKUP_TEAM_ID || "9018866787";
 const PORT = process.env.PORT || 3000;
+const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || "https://web-production-1abd6.up.railway.app";
 
 // Evolution API config
 const EVO_API_URL = process.env.EVO_API_URL || "https://evolution-api-production-3bf028.up.railway.app";
@@ -19,6 +21,43 @@ const botCommentIds = new Set();
 
 // Health check
 app.get("/", (req, res) => res.json({ status: "ok", service: "spen-wa-webhook", hasToken: !!CLICKUP_TOKEN }));
+
+// =============================================
+// SETUP: Create ClickUp webhook (visit once)
+// =============================================
+app.get("/setup", async (req, res) => {
+  try {
+    // Check existing webhooks first
+    const existing = await axios.get(`${CLICKUP_API}/team/${TEAM_ID}/webhook`, {
+      headers: { Authorization: CLICKUP_TOKEN },
+    });
+
+    const alreadyExists = existing.data.webhooks?.find((w) =>
+      w.endpoint?.includes("/webhook/clickup")
+    );
+
+    if (alreadyExists) {
+      return res.json({ message: "ClickUp webhook already exists!", webhook: alreadyExists });
+    }
+
+    // Create new webhook
+    const result = await axios.post(
+      `${CLICKUP_API}/team/${TEAM_ID}/webhook`,
+      {
+        endpoint: `${WEBHOOK_BASE_URL}/webhook/clickup`,
+        events: ["taskCommentPosted"],
+        list_id: LIST_ID,
+      },
+      { headers: { Authorization: CLICKUP_TOKEN } }
+    );
+
+    console.log("ClickUp webhook created:", result.data);
+    res.json({ message: "ClickUp webhook created successfully!", webhook: result.data });
+  } catch (err) {
+    console.error("Setup error:", err.response?.status, err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
 
 // =============================================
 // INBOUND: WhatsApp -> ClickUp Task/Comment
@@ -146,7 +185,7 @@ app.post("/webhook/clickup", async (req, res) => {
     }
 
     // Skip comments that look like inbound WhatsApp messages
-    if (commentText.startsWith("**Received**")) {
+    if (commentText.startsWith("**Received**") || commentText.startsWith("Received")) {
       console.log("Skipping inbound WhatsApp echo");
       return res.sendStatus(200);
     }

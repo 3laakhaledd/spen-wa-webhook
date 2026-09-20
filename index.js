@@ -15,15 +15,15 @@ const EVO_API_URL = process.env.EVO_API_URL || "https://evolution-api-production
 const EVO_API_KEY = process.env.EVO_API_KEY || "spen-evo-2026-secret";
 const EVO_INSTANCE = process.env.EVO_INSTANCE || "spen-whatsapp";
 
-// TEMPORARY: 72h window for testing (change back to 24h = 86400000 after testing)
-const LOOKBACK_MS = 72 * 60 * 60 * 1000; // 72 hours
+// 24h lookback window
+const LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
 // Health check
 app.get("/", (req, res) => res.json({
   status: "ok",
   service: "spen-wa-insights",
   nextRun: "Daily at 8:00 AM (Asia/Riyadh)",
-  lookbackHours: LOOKBACK_MS / 3600000,
+  lookbackHours: 24,
   hasToken: !!CLICKUP_TOKEN,
 }));
 
@@ -312,7 +312,7 @@ app.listen(PORT, () => {
   console.log(`ClickUp token present: ${!!CLICKUP_TOKEN}`);
   console.log(`Target list: ${LIST_ID}`);
   console.log(`Evolution API: ${EVO_API_URL}`);
-  console.log(`Lookback: ${LOOKBACK_MS / 3600000}h (TEMP: change to 24h after testing)`);
+  console.log(`Lookback: 24h`);
   console.log(`Schedule: Daily at 8:00 AM (Asia/Riyadh)`);
   console.log(`Manual trigger: GET /run`);
 });

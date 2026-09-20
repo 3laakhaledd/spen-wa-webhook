@@ -1,5 +1,6 @@
 const express = require("express");
 const axios = require("axios");
+const cron = require("node-cron");
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -7,233 +8,224 @@ app.use(express.json({ limit: '10mb' }));
 const CLICKUP_API = "https://api.clickup.com/api/v2";
 const CLICKUP_TOKEN = process.env.CLICKUP_API_TOKEN;
 const LIST_ID = process.env.CLICKUP_LIST_ID || "901821823676";
-const TEAM_ID = process.env.CLICKUP_TEAM_ID || "9018866787";
 const PORT = process.env.PORT || 3000;
-const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || "https://web-production-1abd6.up.railway.app";
 
 // Evolution API config
 const EVO_API_URL = process.env.EVO_API_URL || "https://evolution-api-production-3bf028.up.railway.app";
 const EVO_API_KEY = process.env.EVO_API_KEY || "spen-evo-2026-secret";
 const EVO_INSTANCE = process.env.EVO_INSTANCE || "spen-whatsapp";
 
-// Track comments we created (to avoid echo loops)
-const botCommentIds = new Set();
-
 // Health check
-app.get("/", (req, res) => res.json({ status: "ok", service: "spen-wa-webhook", hasToken: !!CLICKUP_TOKEN }));
+app.get("/", (req, res) => res.json({
+  status: "ok",
+  service: "spen-wa-insights",
+  nextRun: "Daily at 8:00 AM (Asia/Riyadh)",
+  hasToken: !!CLICKUP_TOKEN,
+}));
 
 // =============================================
-// SETUP: Create ClickUp webhook (visit once)
+// CORE: Fetch chats & messages from last 24h
 // =============================================
-app.get("/setup", async (req, res) => {
-  try {
-    const myEndpoint = `${WEBHOOK_BASE_URL}/webhook/clickup`;
+async function fetchLast24hChats() {
+  const now = Date.now();
+  const since = now - 86400000; // 24 hours ago
 
-    // Check existing webhooks first
-    const existing = await axios.get(`${CLICKUP_API}/team/${TEAM_ID}/webhook`, {
-      headers: { Authorization: CLICKUP_TOKEN },
-    });
+  console.log("Fetching chats from Evolution API...");
 
-    // Only match OUR exact endpoint, not third-party webhooks
-    const alreadyExists = existing.data.webhooks?.find((w) =>
-      w.endpoint === myEndpoint
-    );
+  // Get all chats
+  const chatsRes = await axios.post(
+    `${EVO_API_URL}/chat/findChats/${EVO_INSTANCE}`,
+    {},
+    { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
+  );
 
-    if (alreadyExists) {
-      return res.json({ message: "ClickUp webhook already exists!", webhook: alreadyExists });
-    }
+  const allChats = chatsRes.data || [];
+  console.log(`Found ${allChats.length} total chats`);
 
-    // Create new webhook
-    const result = await axios.post(
-      `${CLICKUP_API}/team/${TEAM_ID}/webhook`,
-      {
-        endpoint: myEndpoint,
-        events: ["taskCommentPosted"],
-      },
-      { headers: { Authorization: CLICKUP_TOKEN } }
-    );
+  // Filter to individual chats (not groups, not status)
+  const individualChats = allChats.filter((c) => {
+    const jid = c.id || c.remoteJid || "";
+    return jid.includes("@s.whatsapp.net") && !jid.startsWith("status");
+  });
 
-    console.log("ClickUp webhook created:", result.data);
-    res.json({ message: "ClickUp webhook created successfully!", webhook: result.data });
-  } catch (err) {
-    console.error("Setup error:", err.response?.status, err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
-  }
-});
+  console.log(`${individualChats.length} individual chats found`);
 
-// =============================================
-// INBOUND: WhatsApp -> ClickUp Task/Comment
-// =============================================
-app.post("/webhook/messages", async (req, res) => {
-  try {
-    const data = req.body;
-    console.log("Incoming WhatsApp event:", data?.event || "unknown");
+  const activeChats = [];
 
-    if (!data || !data.data) {
-      console.log("No data.data found, skipping.");
-      return res.sendStatus(200);
-    }
+  for (const chat of individualChats) {
+    const jid = chat.id || chat.remoteJid;
+    const phone = jid.replace("@s.whatsapp.net", "");
+    const contactName = chat.name || chat.pushName || phone;
 
-    const message = data.data;
-    const phone = message.key?.remoteJid?.replace("@s.whatsapp.net", "") || "unknown";
-    const isFromMe = message.key?.fromMe || false;
-    const senderName = message.pushName || phone;
-    const msgText =
-      message.message?.conversation ||
-      message.message?.extendedTextMessage?.text ||
-      message.message?.imageMessage?.caption ||
-      "[media message]";
-
-    console.log(`Message from ${senderName} (${phone}): ${msgText}`);
-
-    // Skip status broadcasts, group messages, and our own outbound replies
-    if (phone === "status" || message.key?.remoteJid?.includes("@g.us")) {
-      console.log("Skipping status/group message");
-      return res.sendStatus(200);
-    }
-
-    // Skip messages sent by us (outbound replies from ClickUp)
-    if (isFromMe) {
-      console.log("Skipping our own outbound message");
-      return res.sendStatus(200);
-    }
-
-    const commentBody = `**Received** | **${senderName}** (${phone})\n\n${msgText}`;
-
-    // Check for existing task for this phone number today
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const todayMs = today.getTime();
-    const tomorrowMs = todayMs + 86400000;
-
-    console.log("Searching ClickUp for existing task...");
-
-    const searchRes = await axios.get(`${CLICKUP_API}/list/${LIST_ID}/task`, {
-      headers: { Authorization: CLICKUP_TOKEN },
-      params: {
-        order_by: "created",
-        reverse: true,
-        date_created_gt: todayMs,
-        date_created_lt: tomorrowMs,
-        include_closed: false,
-      },
-    });
-
-    console.log("ClickUp search returned", searchRes.data.tasks?.length || 0, "tasks");
-
-    const existingTask = searchRes.data.tasks?.find((t) =>
-      t.name.includes(phone)
-    );
-
-    if (existingTask) {
-      const commentRes = await axios.post(
-        `${CLICKUP_API}/task/${existingTask.id}/comment`,
-        { comment_text: commentBody },
-        { headers: { Authorization: CLICKUP_TOKEN } }
-      );
-      if (commentRes.data?.id) botCommentIds.add(String(commentRes.data.id));
-      console.log(`Comment added to task ${existingTask.id} for ${phone}`);
-    } else {
-      const dateStr = new Date().toLocaleDateString("en-GB");
-      const taskRes = await axios.post(
-        `${CLICKUP_API}/list/${LIST_ID}/task`,
+    try {
+      // Fetch messages for this chat
+      const msgsRes = await axios.post(
+        `${EVO_API_URL}/chat/findMessages/${EVO_INSTANCE}`,
         {
-          name: `WhatsApp: ${senderName} (${phone}) - ${dateStr}`,
-          description: `WhatsApp conversation with **${senderName}** (${phone})\nStarted: ${new Date().toISOString()}`,
-          status: "to do",
+          where: {
+            key: { remoteJid: jid },
+          },
+          limit: 500,
         },
-        { headers: { Authorization: CLICKUP_TOKEN } }
+        { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
       );
 
-      const commentRes = await axios.post(
-        `${CLICKUP_API}/task/${taskRes.data.id}/comment`,
-        { comment_text: commentBody },
-        { headers: { Authorization: CLICKUP_TOKEN } }
-      );
-      if (commentRes.data?.id) botCommentIds.add(String(commentRes.data.id));
-      console.log(`New task created for ${phone}: ${taskRes.data.id}`);
+      const allMessages = msgsRes.data?.messages?.records || msgsRes.data?.messages || msgsRes.data || [];
+
+      // Filter messages from last 24 hours
+      const recentMessages = allMessages.filter((m) => {
+        const msgTime = m.messageTimestamp
+          ? (typeof m.messageTimestamp === "object" ? m.messageTimestamp.low * 1000 : Number(m.messageTimestamp) * 1000)
+          : 0;
+        return msgTime >= since;
+      });
+
+      if (recentMessages.length === 0) continue;
+
+      // Sort chronologically
+      recentMessages.sort((a, b) => {
+        const tA = a.messageTimestamp ? (typeof a.messageTimestamp === "object" ? a.messageTimestamp.low : Number(a.messageTimestamp)) : 0;
+        const tB = b.messageTimestamp ? (typeof b.messageTimestamp === "object" ? b.messageTimestamp.low : Number(b.messageTimestamp)) : 0;
+        return tA - tB;
+      });
+
+      // Format messages into conversation log
+      const formattedMessages = recentMessages.map((m) => {
+        const isFromMe = m.key?.fromMe || false;
+        const direction = isFromMe ? "SENT" : "RECEIVED";
+        const text =
+          m.message?.conversation ||
+          m.message?.extendedTextMessage?.text ||
+          m.message?.imageMessage?.caption ||
+          m.message?.videoMessage?.caption ||
+          m.message?.documentMessage?.title ||
+          "[media]";
+        const ts = m.messageTimestamp
+          ? (typeof m.messageTimestamp === "object" ? m.messageTimestamp.low : Number(m.messageTimestamp))
+          : 0;
+        const time = new Date(ts * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Riyadh" });
+        return `[${time}] ${direction}: ${text}`;
+      });
+
+      const sentCount = recentMessages.filter((m) => m.key?.fromMe).length;
+      const receivedCount = recentMessages.length - sentCount;
+
+      activeChats.push({
+        phone,
+        contactName,
+        messageCount: recentMessages.length,
+        sentCount,
+        receivedCount,
+        conversationLog: formattedMessages.join("\n"),
+        firstMessageTime: recentMessages[0]?.messageTimestamp,
+        lastMessageTime: recentMessages[recentMessages.length - 1]?.messageTimestamp,
+      });
+
+      console.log(`Chat with ${contactName} (${phone}): ${recentMessages.length} messages in last 24h`);
+    } catch (err) {
+      console.error(`Error fetching messages for ${phone}:`, err.response?.status || err.message);
     }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("WhatsApp webhook error:", err.response?.status, err.response?.data || err.message);
-    res.sendStatus(200);
   }
-});
+
+  return activeChats;
+}
 
 // =============================================
-// OUTBOUND: ClickUp Comment -> WhatsApp Reply
+// CORE: Create ClickUp tasks from chat data
 // =============================================
-app.post("/webhook/clickup", async (req, res) => {
+async function createDailyInsights() {
+  console.log("\n========================================");
+  console.log("Starting daily WhatsApp Insights report...");
+  console.log("========================================\n");
+
   try {
-    const data = req.body;
-    console.log("Incoming ClickUp event:", data?.event);
+    const chats = await fetchLast24hChats();
 
-    if (data?.event !== "taskCommentPosted") {
-      return res.sendStatus(200);
+    if (chats.length === 0) {
+      console.log("No active chats in the last 24 hours. Nothing to report.");
+      return { success: true, tasksCreated: 0 };
     }
 
-    const commentId = String(data.history_items?.[0]?.comment?.id || "");
-    const commentText = data.history_items?.[0]?.comment?.text_content || "";
-    const taskId = data.task_id;
+    console.log(`\nCreating ${chats.length} tasks in ClickUp...`);
+    const dateStr = new Date().toLocaleDateString("en-GB", { timeZone: "Asia/Riyadh" });
+    let tasksCreated = 0;
 
-    console.log(`ClickUp comment on task ${taskId}: ${commentText}`);
+    for (const chat of chats) {
+      try {
+        // Create the task
+        const taskRes = await axios.post(
+          `${CLICKUP_API}/list/${LIST_ID}/task`,
+          {
+            name: `${chat.contactName} (${chat.phone}) - ${dateStr}`,
+            description: [
+              `**Contact:** ${chat.contactName}`,
+              `**Phone:** ${chat.phone}`,
+              `**Total Messages:** ${chat.messageCount}`,
+              `**Sent:** ${chat.sentCount} | **Received:** ${chat.receivedCount}`,
+              `**Date:** ${dateStr}`,
+            ].join("\n"),
+            status: "to do",
+          },
+          { headers: { Authorization: CLICKUP_TOKEN } }
+        );
 
-    // Skip if this comment was created by our bot (inbound WhatsApp message)
-    if (botCommentIds.has(commentId)) {
-      console.log("Skipping bot-created comment (from WhatsApp inbound)");
-      botCommentIds.delete(commentId);
-      return res.sendStatus(200);
-    }
+        // Add the full conversation as one comment
+        const commentBody = [
+          `**Chat Log: ${chat.contactName} (${chat.phone})**`,
+          `**Messages: ${chat.messageCount}** (Sent: ${chat.sentCount}, Received: ${chat.receivedCount})`,
+          "",
+          "---",
+          "",
+          chat.conversationLog,
+        ].join("\n");
 
-    // Skip comments that look like inbound WhatsApp messages
-    if (commentText.startsWith("**Received**") || commentText.startsWith("Received")) {
-      console.log("Skipping inbound WhatsApp echo");
-      return res.sendStatus(200);
-    }
+        await axios.post(
+          `${CLICKUP_API}/task/${taskRes.data.id}/comment`,
+          { comment_text: commentBody },
+          { headers: { Authorization: CLICKUP_TOKEN } }
+        );
 
-    // Get the task to extract phone number from name
-    const taskRes = await axios.get(`${CLICKUP_API}/task/${taskId}`, {
-      headers: { Authorization: CLICKUP_TOKEN },
-    });
+        tasksCreated++;
+        console.log(`Task created for ${chat.contactName} (${chat.phone}): ${chat.messageCount} messages`);
 
-    const taskName = taskRes.data.name || "";
-    const phoneMatch = taskName.match(/\((\d+)\)/);
-
-    if (!phoneMatch) {
-      console.log("No phone number found in task name:", taskName);
-      return res.sendStatus(200);
-    }
-
-    const phone = phoneMatch[1];
-    console.log(`Sending reply to WhatsApp ${phone}: ${commentText}`);
-
-    // Send message via Evolution API
-    await axios.post(
-      `${EVO_API_URL}/message/sendText/${EVO_INSTANCE}`,
-      {
-        number: phone,
-        text: commentText,
-      },
-      {
-        headers: {
-          apikey: EVO_API_KEY,
-          "Content-Type": "application/json",
-        },
+        // Small delay to respect ClickUp rate limits
+        await new Promise((r) => setTimeout(r, 600));
+      } catch (err) {
+        console.error(`Failed to create task for ${chat.phone}:`, err.response?.status, err.response?.data || err.message);
       }
-    );
+    }
 
-    console.log(`WhatsApp reply sent to ${phone}`);
-    res.sendStatus(200);
+    console.log(`\nDaily report complete: ${tasksCreated}/${chats.length} tasks created.`);
+    return { success: true, tasksCreated, totalChats: chats.length };
   } catch (err) {
-    console.error("ClickUp webhook error:", err.response?.status, err.response?.data || err.message);
-    res.sendStatus(200);
+    console.error("Daily insights error:", err.response?.status, err.response?.data || err.message);
+    return { success: false, error: err.message };
   }
+}
+
+// =============================================
+// SCHEDULE: Run daily at 8:00 AM Riyadh time
+// =============================================
+// Riyadh = UTC+3, so 8 AM Riyadh = 5 AM UTC
+cron.schedule("0 5 * * *", () => {
+  console.log("Cron triggered: 8:00 AM Riyadh time");
+  createDailyInsights();
+}, { timezone: "Asia/Riyadh" });
+
+// =============================================
+// MANUAL TRIGGER: Run report on demand
+// =============================================
+app.get("/run", async (req, res) => {
+  console.log("Manual trigger: running daily insights now...");
+  const result = await createDailyInsights();
+  res.json(result);
 });
 
 app.listen(PORT, () => {
-  console.log(`SPEN WA Webhook running on port ${PORT}`);
+  console.log(`SPEN WA Insights running on port ${PORT}`);
   console.log(`ClickUp token present: ${!!CLICKUP_TOKEN}`);
   console.log(`Target list: ${LIST_ID}`);
   console.log(`Evolution API: ${EVO_API_URL}`);
+  console.log(`Schedule: Daily at 8:00 AM (Asia/Riyadh)`);
+  console.log(`Manual trigger: GET /run`);
 });

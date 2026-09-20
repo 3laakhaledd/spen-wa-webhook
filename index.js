@@ -27,13 +27,16 @@ app.get("/", (req, res) => res.json({ status: "ok", service: "spen-wa-webhook", 
 // =============================================
 app.get("/setup", async (req, res) => {
   try {
+    const myEndpoint = `${WEBHOOK_BASE_URL}/webhook/clickup`;
+
     // Check existing webhooks first
     const existing = await axios.get(`${CLICKUP_API}/team/${TEAM_ID}/webhook`, {
       headers: { Authorization: CLICKUP_TOKEN },
     });
 
+    // Only match OUR exact endpoint, not third-party webhooks
     const alreadyExists = existing.data.webhooks?.find((w) =>
-      w.endpoint?.includes("/webhook/clickup")
+      w.endpoint === myEndpoint
     );
 
     if (alreadyExists) {
@@ -44,9 +47,8 @@ app.get("/setup", async (req, res) => {
     const result = await axios.post(
       `${CLICKUP_API}/team/${TEAM_ID}/webhook`,
       {
-        endpoint: `${WEBHOOK_BASE_URL}/webhook/clickup`,
+        endpoint: myEndpoint,
         events: ["taskCommentPosted"],
-        list_id: LIST_ID,
       },
       { headers: { Authorization: CLICKUP_TOKEN } }
     );

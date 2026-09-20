@@ -45,16 +45,58 @@ function formatDuration(seconds) {
   return `${h}h ${m}m`;
 }
 
+function getTodayDateStr() {
+  return new Date().toLocaleDateString("en-GB", { timeZone: "Asia/Riyadh" });
+}
+
+// =============================================
+// DEDUP: Get existing tasks for today
+// =============================================
+async function getExistingTaskPhones() {
+  const today = new Date();
+  // Set to midnight Riyadh (UTC+3)
+  const riyadhOffset = 3 * 60 * 60 * 1000;
+  const nowUtc = today.getTime();
+  const riyadhNow = new Date(nowUtc + riyadhOffset);
+  riyadhNow.setUTCHours(0, 0, 0, 0);
+  const todayMs = riyadhNow.getTime() - riyadhOffset;
+  const tomorrowMs = todayMs + 86400000;
+
+  try {
+    const res = await axios.get(`${CLICKUP_API}/list/${LIST_ID}/task`, {
+      headers: { Authorization: CLICKUP_TOKEN },
+      params: {
+        order_by: "created",
+        reverse: true,
+        date_created_gt: todayMs,
+        date_created_lt: tomorrowMs,
+        include_closed: true,
+      },
+    });
+
+    const phones = new Set();
+    for (const task of (res.data.tasks || [])) {
+      const match = task.name.match(/\((\d+)\)/);
+      if (match) phones.add(match[1]);
+    }
+
+    console.log(`Found ${phones.size} existing tasks for today (dedup check)`);
+    return phones;
+  } catch (err) {
+    console.error("Dedup check failed:", err.response?.status || err.message);
+    return new Set();
+  }
+}
+
 // =============================================
 // CORE: Fetch chats & messages from last 24h
 // =============================================
 async function fetchLast24hChats() {
   const now = Date.now();
-  const since = now - 86400000; // 24 hours ago
+  const since = now - 86400000;
 
   console.log("Fetching chats from Evolution API...");
 
-  // Get all chats
   const chatsRes = await axios.post(
     `${EVO_API_URL}/chat/findChats/${EVO_INSTANCE}`,
     {},
@@ -64,7 +106,6 @@ async function fetchLast24hChats() {
   const allChats = chatsRes.data || [];
   console.log(`Found ${allChats.length} total chats`);
 
-  // Filter to individual chats (not groups, not status)
   const individualChats = allChats.filter((c) => {
     const jid = c.id || c.remoteJid || "";
     return jid.includes("@s.whatsapp.net") && !jid.startsWith("status");
@@ -80,13 +121,10 @@ async function fetchLast24hChats() {
     const contactName = chat.name || chat.pushName || phone;
 
     try {
-      // Fetch messages for this chat
       const msgsRes = await axios.post(
         `${EVO_API_URL}/chat/findMessages/${EVO_INSTANCE}`,
         {
-          where: {
-            key: { remoteJid: jid },
-          },
+          where: { key: { remoteJid: jid } },
           limit: 500,
         },
         { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
@@ -94,7 +132,6 @@ async function fetchLast24hChats() {
 
       const allMessages = msgsRes.data?.messages?.records || msgsRes.data?.messages || msgsRes.data || [];
 
-      // Filter messages from last 24 hours
       const recentMessages = allMessages.filter((m) => {
         const msgTime = getMsgTimestamp(m) * 1000;
         return msgTime >= since;
@@ -102,14 +139,11 @@ async function fetchLast24hChats() {
 
       if (recentMessages.length === 0) continue;
 
-      // Sort chronologically
       recentMessages.sort((a, b) => getMsgTimestamp(a) - getMsgTimestamp(b));
 
-      // Find first customer message (not from me)
       const firstCustomerMsg = recentMessages.find((m) => !m.key?.fromMe);
       const firstCustomerTime = firstCustomerMsg ? getMsgTimestamp(firstCustomerMsg) : 0;
 
-      // Find our first response AFTER the first customer message
       let firstResponseTime = 0;
       let responseDelaySec = null;
       if (firstCustomerTime > 0) {
@@ -122,12 +156,10 @@ async function fetchLast24hChats() {
         }
       }
 
-      // Determine chat status: last message from customer = Open, from us = Closed
       const lastMessage = recentMessages[recentMessages.length - 1];
       const lastMessageFromMe = lastMessage?.key?.fromMe || false;
       const chatStatus = lastMessageFromMe ? "Closed" : "Open";
 
-      // Format messages into conversation log
       const formattedMessages = recentMessages.map((m) => {
         const isFromMe = m.key?.fromMe || false;
         const direction = isFromMe ? "SENT" : "RECEIVED";
@@ -181,16 +213,25 @@ async function createDailyInsights() {
 
     if (chats.length === 0) {
       console.log("No active chats in the last 24 hours. Nothing to report.");
-      return { success: true, tasksCreated: 0 };
+      return { success: true, tasksCreated: 0, skipped: 0 };
     }
 
-    console.log(`\nCreating ${chats.length} tasks in ClickUp...`);
-    const dateStr = new Date().toLocaleDateString("en-GB", { timeZone: "Asia/Riyadh" });
+    // Dedup: check which phones already have tasks today
+    const existingPhones = await getExistingTaskPhones();
+
+    const dateStr = getTodayDateStr();
     let tasksCreated = 0;
+    let skipped = 0;
 
     for (const chat of chats) {
+      // Skip if a task for this phone already exists today
+      if (existingPhones.has(chat.phone)) {
+        console.log(`Skipping ${chat.contactName} (${chat.phone}): task already exists today`);
+        skipped++;
+        continue;
+      }
+
       try {
-        // Build description
         const descLines = [
           `**Contact:** ${chat.contactName}`,
           `**Phone:** ${chat.phone}`,
@@ -201,13 +242,11 @@ async function createDailyInsights() {
           `**Our First Response:** ${chat.firstResponseTime ? formatTime(chat.firstResponseTime) : "No response yet"}`,
           `**Response Time:** ${chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "N/A"}`,
           "",
-          `**Chat Status:** ${chat.chatStatus === "Open" ? "🔴 Open (awaiting our reply)" : "🟢 Closed (we replied last)"}`,
+          `**Chat Status:** ${chat.chatStatus === "Open" ? "\ud83d\udd34 Open (awaiting our reply)" : "\ud83d\udfe2 Closed (we replied last)"}`,
         ];
 
-        // Determine task status based on chat status
         const taskStatus = chat.chatStatus === "Open" ? "to do" : "complete";
 
-        // Create the task
         const taskRes = await axios.post(
           `${CLICKUP_API}/list/${LIST_ID}/task`,
           {
@@ -218,7 +257,6 @@ async function createDailyInsights() {
           { headers: { Authorization: CLICKUP_TOKEN } }
         );
 
-        // Add the full conversation as one comment
         const commentBody = [
           `**Chat Log: ${chat.contactName} (${chat.phone})**`,
           `**Messages: ${chat.messageCount}** | **Response Time: ${chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "No response"}** | **Status: ${chat.chatStatus}**`,
@@ -235,17 +273,16 @@ async function createDailyInsights() {
         );
 
         tasksCreated++;
-        console.log(`Task created: ${chat.contactName} (${chat.phone}) | ${chat.messageCount} msgs | ${chat.chatStatus} | Response: ${chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "none"}`);
+        console.log(`Task created: ${chat.contactName} (${chat.phone}) | ${chat.messageCount} msgs | ${chat.chatStatus}`);
 
-        // Small delay to respect ClickUp rate limits
         await new Promise((r) => setTimeout(r, 600));
       } catch (err) {
         console.error(`Failed to create task for ${chat.phone}:`, err.response?.status, err.response?.data || err.message);
       }
     }
 
-    console.log(`\nDaily report complete: ${tasksCreated}/${chats.length} tasks created.`);
-    return { success: true, tasksCreated, totalChats: chats.length };
+    console.log(`\nReport complete: ${tasksCreated} created, ${skipped} skipped (already existed).`);
+    return { success: true, tasksCreated, skipped, totalChats: chats.length };
   } catch (err) {
     console.error("Daily insights error:", err.response?.status, err.response?.data || err.message);
     return { success: false, error: err.message };

@@ -6,7 +6,7 @@ app.use(express.json({ limit: '10mb' }));
 
 const CLICKUP_API = "https://api.clickup.com/api/v2";
 const CLICKUP_TOKEN = process.env.CLICKUP_API_TOKEN;
-const LIST_ID = process.env.CLICKUP_LIST_ID || "1018657164762024505";
+const LIST_ID = process.env.CLICKUP_LIST_ID || "901821823676";
 const PORT = process.env.PORT || 3000;
 
 // Health check
@@ -17,17 +17,14 @@ app.post("/webhook/messages", async (req, res) => {
   try {
     const data = req.body;
     console.log("Incoming webhook event:", data?.event || "unknown");
-    console.log("Payload keys:", Object.keys(data || {}));
 
     // Evolution API sends different event types
     if (!data || !data.data) {
-      console.log("No data.data found, skipping. Full body:", JSON.stringify(data).substring(0, 500));
+      console.log("No data.data found, skipping.");
       return res.sendStatus(200);
     }
 
     const message = data.data;
-    console.log("Message keys:", Object.keys(message || {}));
-
     const phone = message.key?.remoteJid?.replace("@s.whatsapp.net", "") || "unknown";
     const isFromMe = message.key?.fromMe || false;
     const senderName = message.pushName || phone;
@@ -55,7 +52,6 @@ app.post("/webhook/messages", async (req, res) => {
     const tomorrowMs = todayMs + 86400000;
 
     console.log("Searching ClickUp for existing task...");
-    console.log("Token present:", !!CLICKUP_TOKEN, "Token starts with:", CLICKUP_TOKEN?.substring(0, 5));
 
     // Search for tasks with this phone number in the name, created today
     const searchRes = await axios.get(`${CLICKUP_API}/list/${LIST_ID}/task`, {
@@ -108,7 +104,7 @@ app.post("/webhook/messages", async (req, res) => {
     res.sendStatus(200);
   } catch (err) {
     console.error("Webhook error:", err.response?.status, err.response?.data || err.message);
-    res.sendStatus(200); // Return 200 anyway so Evolution stops retrying
+    res.sendStatus(200);
   }
 });
 

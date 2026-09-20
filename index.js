@@ -9,16 +9,25 @@ const CLICKUP_TOKEN = process.env.CLICKUP_API_TOKEN;
 const LIST_ID = process.env.CLICKUP_LIST_ID || "901821823676";
 const PORT = process.env.PORT || 3000;
 
+// Evolution API config
+const EVO_API_URL = process.env.EVO_API_URL || "https://evolution-api-production-3bf028.up.railway.app";
+const EVO_API_KEY = process.env.EVO_API_KEY || "spen-evo-2026-secret";
+const EVO_INSTANCE = process.env.EVO_INSTANCE || "spen-whatsapp";
+
+// Track comments we created (to avoid echo loops)
+const botCommentIds = new Set();
+
 // Health check
 app.get("/", (req, res) => res.json({ status: "ok", service: "spen-wa-webhook", hasToken: !!CLICKUP_TOKEN }));
 
-// Evolution API webhook receiver
+// =============================================
+// INBOUND: WhatsApp -> ClickUp Task/Comment
+// =============================================
 app.post("/webhook/messages", async (req, res) => {
   try {
     const data = req.body;
-    console.log("Incoming webhook event:", data?.event || "unknown");
+    console.log("Incoming WhatsApp event:", data?.event || "unknown");
 
-    // Evolution API sends different event types
     if (!data || !data.data) {
       console.log("No data.data found, skipping.");
       return res.sendStatus(200);
@@ -36,14 +45,19 @@ app.post("/webhook/messages", async (req, res) => {
 
     console.log(`Message from ${senderName} (${phone}): ${msgText}`);
 
-    // Skip status broadcasts and group messages
+    // Skip status broadcasts, group messages, and our own outbound replies
     if (phone === "status" || message.key?.remoteJid?.includes("@g.us")) {
       console.log("Skipping status/group message");
       return res.sendStatus(200);
     }
 
-    const direction = isFromMe ? "Sent" : "Received";
-    const commentBody = `**${direction}** | **${senderName}** (${phone})\n\n${msgText}`;
+    // Skip messages sent by us (outbound replies from ClickUp)
+    if (isFromMe) {
+      console.log("Skipping our own outbound message");
+      return res.sendStatus(200);
+    }
+
+    const commentBody = `**Received** | **${senderName}** (${phone})\n\n${msgText}`;
 
     // Check for existing task for this phone number today
     const today = new Date();
@@ -53,7 +67,6 @@ app.post("/webhook/messages", async (req, res) => {
 
     console.log("Searching ClickUp for existing task...");
 
-    // Search for tasks with this phone number in the name, created today
     const searchRes = await axios.get(`${CLICKUP_API}/list/${LIST_ID}/task`, {
       headers: { Authorization: CLICKUP_TOKEN },
       params: {
@@ -72,15 +85,14 @@ app.post("/webhook/messages", async (req, res) => {
     );
 
     if (existingTask) {
-      // Add message as comment to existing task
-      await axios.post(
+      const commentRes = await axios.post(
         `${CLICKUP_API}/task/${existingTask.id}/comment`,
         { comment_text: commentBody },
         { headers: { Authorization: CLICKUP_TOKEN } }
       );
+      if (commentRes.data?.id) botCommentIds.add(String(commentRes.data.id));
       console.log(`Comment added to task ${existingTask.id} for ${phone}`);
     } else {
-      // Create new task for today's conversation
       const dateStr = new Date().toLocaleDateString("en-GB");
       const taskRes = await axios.post(
         `${CLICKUP_API}/list/${LIST_ID}/task`,
@@ -92,18 +104,88 @@ app.post("/webhook/messages", async (req, res) => {
         { headers: { Authorization: CLICKUP_TOKEN } }
       );
 
-      // Add first message as comment
-      await axios.post(
+      const commentRes = await axios.post(
         `${CLICKUP_API}/task/${taskRes.data.id}/comment`,
         { comment_text: commentBody },
         { headers: { Authorization: CLICKUP_TOKEN } }
       );
+      if (commentRes.data?.id) botCommentIds.add(String(commentRes.data.id));
       console.log(`New task created for ${phone}: ${taskRes.data.id}`);
     }
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("Webhook error:", err.response?.status, err.response?.data || err.message);
+    console.error("WhatsApp webhook error:", err.response?.status, err.response?.data || err.message);
+    res.sendStatus(200);
+  }
+});
+
+// =============================================
+// OUTBOUND: ClickUp Comment -> WhatsApp Reply
+// =============================================
+app.post("/webhook/clickup", async (req, res) => {
+  try {
+    const data = req.body;
+    console.log("Incoming ClickUp event:", data?.event);
+
+    if (data?.event !== "taskCommentPosted") {
+      return res.sendStatus(200);
+    }
+
+    const commentId = String(data.history_items?.[0]?.comment?.id || "");
+    const commentText = data.history_items?.[0]?.comment?.text_content || "";
+    const taskId = data.task_id;
+
+    console.log(`ClickUp comment on task ${taskId}: ${commentText}`);
+
+    // Skip if this comment was created by our bot (inbound WhatsApp message)
+    if (botCommentIds.has(commentId)) {
+      console.log("Skipping bot-created comment (from WhatsApp inbound)");
+      botCommentIds.delete(commentId);
+      return res.sendStatus(200);
+    }
+
+    // Skip comments that look like inbound WhatsApp messages
+    if (commentText.startsWith("**Received**")) {
+      console.log("Skipping inbound WhatsApp echo");
+      return res.sendStatus(200);
+    }
+
+    // Get the task to extract phone number from name
+    const taskRes = await axios.get(`${CLICKUP_API}/task/${taskId}`, {
+      headers: { Authorization: CLICKUP_TOKEN },
+    });
+
+    const taskName = taskRes.data.name || "";
+    const phoneMatch = taskName.match(/\((\d+)\)/);
+
+    if (!phoneMatch) {
+      console.log("No phone number found in task name:", taskName);
+      return res.sendStatus(200);
+    }
+
+    const phone = phoneMatch[1];
+    console.log(`Sending reply to WhatsApp ${phone}: ${commentText}`);
+
+    // Send message via Evolution API
+    await axios.post(
+      `${EVO_API_URL}/message/sendText/${EVO_INSTANCE}`,
+      {
+        number: phone,
+        text: commentText,
+      },
+      {
+        headers: {
+          apikey: EVO_API_KEY,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log(`WhatsApp reply sent to ${phone}`);
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("ClickUp webhook error:", err.response?.status, err.response?.data || err.message);
     res.sendStatus(200);
   }
 });
@@ -112,4 +194,5 @@ app.listen(PORT, () => {
   console.log(`SPEN WA Webhook running on port ${PORT}`);
   console.log(`ClickUp token present: ${!!CLICKUP_TOKEN}`);
   console.log(`Target list: ${LIST_ID}`);
+  console.log(`Evolution API: ${EVO_API_URL}`);
 });

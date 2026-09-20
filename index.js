@@ -24,6 +24,28 @@ app.get("/", (req, res) => res.json({
 }));
 
 // =============================================
+// HELPERS
+// =============================================
+function getMsgTimestamp(m) {
+  if (!m.messageTimestamp) return 0;
+  return typeof m.messageTimestamp === "object" ? m.messageTimestamp.low : Number(m.messageTimestamp);
+}
+
+function formatTime(epochSec) {
+  return new Date(epochSec * 1000).toLocaleTimeString("en-GB", {
+    hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Riyadh"
+  });
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+// =============================================
 // CORE: Fetch chats & messages from last 24h
 // =============================================
 async function fetchLast24hChats() {
@@ -74,20 +96,36 @@ async function fetchLast24hChats() {
 
       // Filter messages from last 24 hours
       const recentMessages = allMessages.filter((m) => {
-        const msgTime = m.messageTimestamp
-          ? (typeof m.messageTimestamp === "object" ? m.messageTimestamp.low * 1000 : Number(m.messageTimestamp) * 1000)
-          : 0;
+        const msgTime = getMsgTimestamp(m) * 1000;
         return msgTime >= since;
       });
 
       if (recentMessages.length === 0) continue;
 
       // Sort chronologically
-      recentMessages.sort((a, b) => {
-        const tA = a.messageTimestamp ? (typeof a.messageTimestamp === "object" ? a.messageTimestamp.low : Number(a.messageTimestamp)) : 0;
-        const tB = b.messageTimestamp ? (typeof b.messageTimestamp === "object" ? b.messageTimestamp.low : Number(b.messageTimestamp)) : 0;
-        return tA - tB;
-      });
+      recentMessages.sort((a, b) => getMsgTimestamp(a) - getMsgTimestamp(b));
+
+      // Find first customer message (not from me)
+      const firstCustomerMsg = recentMessages.find((m) => !m.key?.fromMe);
+      const firstCustomerTime = firstCustomerMsg ? getMsgTimestamp(firstCustomerMsg) : 0;
+
+      // Find our first response AFTER the first customer message
+      let firstResponseTime = 0;
+      let responseDelaySec = null;
+      if (firstCustomerTime > 0) {
+        const firstResponse = recentMessages.find(
+          (m) => m.key?.fromMe && getMsgTimestamp(m) > firstCustomerTime
+        );
+        if (firstResponse) {
+          firstResponseTime = getMsgTimestamp(firstResponse);
+          responseDelaySec = firstResponseTime - firstCustomerTime;
+        }
+      }
+
+      // Determine chat status: last message from customer = Open, from us = Closed
+      const lastMessage = recentMessages[recentMessages.length - 1];
+      const lastMessageFromMe = lastMessage?.key?.fromMe || false;
+      const chatStatus = lastMessageFromMe ? "Closed" : "Open";
 
       // Format messages into conversation log
       const formattedMessages = recentMessages.map((m) => {
@@ -100,10 +138,8 @@ async function fetchLast24hChats() {
           m.message?.videoMessage?.caption ||
           m.message?.documentMessage?.title ||
           "[media]";
-        const ts = m.messageTimestamp
-          ? (typeof m.messageTimestamp === "object" ? m.messageTimestamp.low : Number(m.messageTimestamp))
-          : 0;
-        const time = new Date(ts * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Riyadh" });
+        const ts = getMsgTimestamp(m);
+        const time = formatTime(ts);
         return `[${time}] ${direction}: ${text}`;
       });
 
@@ -117,11 +153,13 @@ async function fetchLast24hChats() {
         sentCount,
         receivedCount,
         conversationLog: formattedMessages.join("\n"),
-        firstMessageTime: recentMessages[0]?.messageTimestamp,
-        lastMessageTime: recentMessages[recentMessages.length - 1]?.messageTimestamp,
+        firstCustomerTime,
+        firstResponseTime,
+        responseDelaySec,
+        chatStatus,
       });
 
-      console.log(`Chat with ${contactName} (${phone}): ${recentMessages.length} messages in last 24h`);
+      console.log(`Chat with ${contactName} (${phone}): ${recentMessages.length} msgs, status: ${chatStatus}`);
     } catch (err) {
       console.error(`Error fetching messages for ${phone}:`, err.response?.status || err.message);
     }
@@ -152,19 +190,30 @@ async function createDailyInsights() {
 
     for (const chat of chats) {
       try {
+        // Build description
+        const descLines = [
+          `**Contact:** ${chat.contactName}`,
+          `**Phone:** ${chat.phone}`,
+          `**Total Messages:** ${chat.messageCount} (Sent: ${chat.sentCount}, Received: ${chat.receivedCount})`,
+          `**Date:** ${dateStr}`,
+          "",
+          `**First Message:** ${chat.firstCustomerTime ? formatTime(chat.firstCustomerTime) : "N/A"}`,
+          `**Our First Response:** ${chat.firstResponseTime ? formatTime(chat.firstResponseTime) : "No response yet"}`,
+          `**Response Time:** ${chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "N/A"}`,
+          "",
+          `**Chat Status:** ${chat.chatStatus === "Open" ? "🔴 Open (awaiting our reply)" : "🟢 Closed (we replied last)"}`,
+        ];
+
+        // Determine task status based on chat status
+        const taskStatus = chat.chatStatus === "Open" ? "to do" : "complete";
+
         // Create the task
         const taskRes = await axios.post(
           `${CLICKUP_API}/list/${LIST_ID}/task`,
           {
             name: `${chat.contactName} (${chat.phone}) - ${dateStr}`,
-            description: [
-              `**Contact:** ${chat.contactName}`,
-              `**Phone:** ${chat.phone}`,
-              `**Total Messages:** ${chat.messageCount}`,
-              `**Sent:** ${chat.sentCount} | **Received:** ${chat.receivedCount}`,
-              `**Date:** ${dateStr}`,
-            ].join("\n"),
-            status: "to do",
+            description: descLines.join("\n"),
+            status: taskStatus,
           },
           { headers: { Authorization: CLICKUP_TOKEN } }
         );
@@ -172,7 +221,7 @@ async function createDailyInsights() {
         // Add the full conversation as one comment
         const commentBody = [
           `**Chat Log: ${chat.contactName} (${chat.phone})**`,
-          `**Messages: ${chat.messageCount}** (Sent: ${chat.sentCount}, Received: ${chat.receivedCount})`,
+          `**Messages: ${chat.messageCount}** | **Response Time: ${chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "No response"}** | **Status: ${chat.chatStatus}**`,
           "",
           "---",
           "",
@@ -186,7 +235,7 @@ async function createDailyInsights() {
         );
 
         tasksCreated++;
-        console.log(`Task created for ${chat.contactName} (${chat.phone}): ${chat.messageCount} messages`);
+        console.log(`Task created: ${chat.contactName} (${chat.phone}) | ${chat.messageCount} msgs | ${chat.chatStatus} | Response: ${chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "none"}`);
 
         // Small delay to respect ClickUp rate limits
         await new Promise((r) => setTimeout(r, 600));
@@ -206,7 +255,6 @@ async function createDailyInsights() {
 // =============================================
 // SCHEDULE: Run daily at 8:00 AM Riyadh time
 // =============================================
-// Riyadh = UTC+3, so 8 AM Riyadh = 5 AM UTC
 cron.schedule("0 5 * * *", () => {
   console.log("Cron triggered: 8:00 AM Riyadh time");
   createDailyInsights();

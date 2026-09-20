@@ -1,13 +1,14 @@
 {
   "name": "spen-wa-webhook",
-  "version": "1.0.0",
-  "description": "WhatsApp to ClickUp webhook bridge",
+  "version": "2.0.0",
+  "description": "WhatsApp Insights: daily batch report to ClickUp",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "node-cron": "^3.0.3"
   }
 }

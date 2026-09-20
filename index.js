@@ -15,11 +15,15 @@ const EVO_API_URL = process.env.EVO_API_URL || "https://evolution-api-production
 const EVO_API_KEY = process.env.EVO_API_KEY || "spen-evo-2026-secret";
 const EVO_INSTANCE = process.env.EVO_INSTANCE || "spen-whatsapp";
 
+// TEMPORARY: 72h window for testing (change back to 24h = 86400000 after testing)
+const LOOKBACK_MS = 72 * 60 * 60 * 1000; // 72 hours
+
 // Health check
 app.get("/", (req, res) => res.json({
   status: "ok",
   service: "spen-wa-insights",
   nextRun: "Daily at 8:00 AM (Asia/Riyadh)",
+  lookbackHours: LOOKBACK_MS / 3600000,
   hasToken: !!CLICKUP_TOKEN,
 }));
 
@@ -54,7 +58,6 @@ function getTodayDateStr() {
 // =============================================
 async function getExistingTaskPhones() {
   const today = new Date();
-  // Set to midnight Riyadh (UTC+3)
   const riyadhOffset = 3 * 60 * 60 * 1000;
   const nowUtc = today.getTime();
   const riyadhNow = new Date(nowUtc + riyadhOffset);
@@ -89,13 +92,13 @@ async function getExistingTaskPhones() {
 }
 
 // =============================================
-// CORE: Fetch chats & messages from last 24h
+// CORE: Fetch chats & messages from lookback
 // =============================================
-async function fetchLast24hChats() {
+async function fetchRecentChats() {
   const now = Date.now();
-  const since = now - 86400000;
+  const since = now - LOOKBACK_MS;
 
-  console.log("Fetching chats from Evolution API...");
+  console.log(`Fetching chats from last ${LOOKBACK_MS / 3600000}h...`);
 
   const chatsRes = await axios.post(
     `${EVO_API_URL}/chat/findChats/${EVO_INSTANCE}`,
@@ -205,18 +208,17 @@ async function fetchLast24hChats() {
 // =============================================
 async function createDailyInsights() {
   console.log("\n========================================");
-  console.log("Starting daily WhatsApp Insights report...");
+  console.log("Starting WhatsApp Insights report...");
   console.log("========================================\n");
 
   try {
-    const chats = await fetchLast24hChats();
+    const chats = await fetchRecentChats();
 
     if (chats.length === 0) {
-      console.log("No active chats in the last 24 hours. Nothing to report.");
+      console.log("No active chats found. Nothing to report.");
       return { success: true, tasksCreated: 0, skipped: 0 };
     }
 
-    // Dedup: check which phones already have tasks today
     const existingPhones = await getExistingTaskPhones();
 
     const dateStr = getTodayDateStr();
@@ -224,7 +226,6 @@ async function createDailyInsights() {
     let skipped = 0;
 
     for (const chat of chats) {
-      // Skip if a task for this phone already exists today
       if (existingPhones.has(chat.phone)) {
         console.log(`Skipping ${chat.contactName} (${chat.phone}): task already exists today`);
         skipped++;
@@ -284,7 +285,7 @@ async function createDailyInsights() {
     console.log(`\nReport complete: ${tasksCreated} created, ${skipped} skipped (already existed).`);
     return { success: true, tasksCreated, skipped, totalChats: chats.length };
   } catch (err) {
-    console.error("Daily insights error:", err.response?.status, err.response?.data || err.message);
+    console.error("Insights error:", err.response?.status, err.response?.data || err.message);
     return { success: false, error: err.message };
   }
 }
@@ -301,7 +302,7 @@ cron.schedule("0 5 * * *", () => {
 // MANUAL TRIGGER: Run report on demand
 // =============================================
 app.get("/run", async (req, res) => {
-  console.log("Manual trigger: running daily insights now...");
+  console.log("Manual trigger: running insights now...");
   const result = await createDailyInsights();
   res.json(result);
 });
@@ -311,6 +312,7 @@ app.listen(PORT, () => {
   console.log(`ClickUp token present: ${!!CLICKUP_TOKEN}`);
   console.log(`Target list: ${LIST_ID}`);
   console.log(`Evolution API: ${EVO_API_URL}`);
+  console.log(`Lookback: ${LOOKBACK_MS / 3600000}h (TEMP: change to 24h after testing)`);
   console.log(`Schedule: Daily at 8:00 AM (Asia/Riyadh)`);
   console.log(`Manual trigger: GET /run`);
 });

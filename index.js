@@ -25,6 +25,10 @@ app.get("/", (req, res) => res.json({
   nextRun: "Daily at 8:00 AM (Asia/Riyadh)",
   lookbackHours: 24,
   hasToken: !!CLICKUP_TOKEN,
+  endpoints: {
+    run: "GET /run - manual daily report",
+    search: "GET /search?phone=XXXXX&limit=100 - search WhatsApp chat history",
+  },
 }));
 
 // =============================================
@@ -41,6 +45,19 @@ function formatTime(epochSec) {
   });
 }
 
+function formatDate(epochSec) {
+  return new Date(epochSec * 1000).toLocaleDateString("en-GB", {
+    day: "2-digit", month: "short", year: "numeric", timeZone: "Asia/Riyadh"
+  });
+}
+
+function formatDateTime(epochSec) {
+  return new Date(epochSec * 1000).toLocaleString("en-GB", {
+    day: "2-digit", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Riyadh"
+  });
+}
+
 function formatDuration(seconds) {
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
@@ -52,6 +69,99 @@ function formatDuration(seconds) {
 function getTodayDateStr() {
   return new Date().toLocaleDateString("en-GB", { timeZone: "Asia/Riyadh" });
 }
+
+// =============================================
+// SEARCH: Query WhatsApp chat history by phone
+// =============================================
+app.get("/search", async (req, res) => {
+  try {
+    const phone = req.query.phone;
+    const limit = parseInt(req.query.limit) || 200;
+
+    if (!phone) {
+      return res.status(400).json({ error: "Missing ?phone= parameter. Usage: /search?phone=966548692404&limit=100" });
+    }
+
+    console.log(`Searching WhatsApp history for ${phone} (limit: ${limit})...`);
+
+    const jid = `${phone}@s.whatsapp.net`;
+
+    // Fetch messages from Evolution API
+    const msgsRes = await axios.post(
+      `${EVO_API_URL}/chat/findMessages/${EVO_INSTANCE}`,
+      {
+        where: { key: { remoteJid: jid } },
+        limit: limit,
+      },
+      { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
+    );
+
+    const allMessages = msgsRes.data?.messages?.records || msgsRes.data?.messages || msgsRes.data || [];
+
+    if (allMessages.length === 0) {
+      return res.json({
+        phone,
+        totalMessages: 0,
+        note: "No messages found. Evolution API only stores messages since the WhatsApp session was connected.",
+        messages: [],
+      });
+    }
+
+    // Sort chronologically
+    allMessages.sort((a, b) => getMsgTimestamp(a) - getMsgTimestamp(b));
+
+    // Get contact name from first message
+    const contactName = allMessages.find((m) => m.pushName)?.pushName || phone;
+
+    // Format messages
+    const formatted = allMessages.map((m) => {
+      const ts = getMsgTimestamp(m);
+      const isFromMe = m.key?.fromMe || false;
+      const text =
+        m.message?.conversation ||
+        m.message?.extendedTextMessage?.text ||
+        m.message?.imageMessage?.caption ||
+        m.message?.videoMessage?.caption ||
+        m.message?.documentMessage?.title ||
+        "[media]";
+      return {
+        time: formatDateTime(ts),
+        timestamp: ts,
+        direction: isFromMe ? "SENT" : "RECEIVED",
+        sender: isFromMe ? "You" : contactName,
+        text,
+      };
+    });
+
+    const sentCount = formatted.filter((m) => m.direction === "SENT").length;
+    const receivedCount = formatted.length - sentCount;
+
+    // Group by date
+    const byDate = {};
+    for (const msg of formatted) {
+      const date = formatDate(msg.timestamp);
+      if (!byDate[date]) byDate[date] = [];
+      byDate[date].push(`[${msg.time.split(",")[1]?.trim() || msg.time}] ${msg.direction}: ${msg.text}`);
+    }
+
+    res.json({
+      phone,
+      contactName,
+      totalMessages: formatted.length,
+      sent: sentCount,
+      received: receivedCount,
+      firstMessage: formatted[0]?.time || "N/A",
+      lastMessage: formatted[formatted.length - 1]?.time || "N/A",
+      byDate,
+      messages: formatted,
+    });
+
+    console.log(`Search complete: ${formatted.length} messages for ${phone}`);
+  } catch (err) {
+    console.error("Search error:", err.response?.status, err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
 
 // =============================================
 // DEDUP: Get existing tasks for today
@@ -315,4 +425,5 @@ app.listen(PORT, () => {
   console.log(`Lookback: 24h`);
   console.log(`Schedule: Daily at 8:00 AM (Asia/Riyadh)`);
   console.log(`Manual trigger: GET /run`);
+  console.log(`Search: GET /search?phone=XXXXX`);
 });

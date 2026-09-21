@@ -29,6 +29,7 @@ app.get("/", (req, res) => res.json({
     run: "GET /run - manual daily report",
     search: "GET /search?phone=XXXXX&limit=100 - search WhatsApp chat history",
     chats: "GET /chats?preview=true&limit=20 - list all chats with optional last-message preview",
+    insights: "GET /insights?date=YYYY-MM-DD - scan ALL chats for a date (defaults to yesterday)",
   },
 }));
 
@@ -79,6 +80,135 @@ function getMessageText(m) {
     m.message?.documentMessage?.title ||
     "[media]";
 }
+
+// =============================================
+// INSIGHTS: Scan ALL chats for a specific date
+// =============================================
+app.get("/insights", async (req, res) => {
+  try {
+    const riyadhOffset = 3 * 60 * 60 * 1000;
+    let targetStart, targetEnd, dateLabel;
+
+    if (req.query.date) {
+      const parts = req.query.date.split("-");
+      const d = new Date(Date.UTC(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2])));
+      targetStart = d.getTime() - riyadhOffset;
+      targetEnd = targetStart + 86400000;
+      dateLabel = req.query.date;
+    } else {
+      const nowUtc = Date.now();
+      const riyadhNow = new Date(nowUtc + riyadhOffset);
+      riyadhNow.setUTCHours(0, 0, 0, 0);
+      const todayMs = riyadhNow.getTime() - riyadhOffset;
+      targetStart = todayMs - 86400000;
+      targetEnd = todayMs;
+      const d = new Date(targetStart + riyadhOffset);
+      dateLabel = d.toISOString().split("T")[0];
+    }
+
+    console.log("Insights scan for " + dateLabel);
+
+    const chatsRes = await axios.post(
+      EVO_API_URL + "/chat/findChats/" + EVO_INSTANCE,
+      {},
+      { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
+    );
+
+    const allChats = chatsRes.data || [];
+    const individualChats = allChats.filter((c) => {
+      const jid = c.id || c.remoteJid || "";
+      return jid.includes("@s.whatsapp.net") && !jid.startsWith("status");
+    });
+
+    console.log("Scanning " + individualChats.length + " chats for " + dateLabel + "...");
+
+    const activeChats = [];
+    let scanned = 0;
+
+    for (const chat of individualChats) {
+      const jid = chat.id || chat.remoteJid;
+      const phone = jid.replace("@s.whatsapp.net", "");
+      const contactName = chat.name || chat.pushName || phone;
+
+      try {
+        const msgsRes = await axios.post(
+          EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE,
+          {
+            where: { key: { remoteJid: jid } },
+            limit: 500,
+          },
+          { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
+        );
+
+        const allMessages = msgsRes.data?.messages?.records || msgsRes.data?.messages || msgsRes.data || [];
+
+        const dayMessages = allMessages.filter((m) => {
+          const msgTime = getMsgTimestamp(m) * 1000;
+          return msgTime >= targetStart && msgTime < targetEnd;
+        });
+
+        if (dayMessages.length === 0) {
+          scanned++;
+          if (scanned % 50 === 0) console.log("Scanned " + scanned + "/" + individualChats.length + "...");
+          continue;
+        }
+
+        dayMessages.sort((a, b) => getMsgTimestamp(a) - getMsgTimestamp(b));
+
+        const sentCount = dayMessages.filter((m) => m.key?.fromMe).length;
+        const receivedCount = dayMessages.length - sentCount;
+
+        const firstMsg = dayMessages[0];
+        const initiatedBy = firstMsg.key?.fromMe ? "us" : "customer";
+
+        const lastMsg = dayMessages[dayMessages.length - 1];
+        const chatStatus = lastMsg.key?.fromMe ? "Closed" : "Open";
+
+        const conversationLog = dayMessages.map((m) => {
+          const isFromMe = m.key?.fromMe || false;
+          const direction = isFromMe ? "SENT" : "RECEIVED";
+          const ts = getMsgTimestamp(m);
+          const time = formatTime(ts);
+          return "[" + time + "] " + direction + ": " + getMessageText(m);
+        }).join("\n");
+
+        activeChats.push({
+          phone,
+          contactName,
+          messageCount: dayMessages.length,
+          sent: sentCount,
+          received: receivedCount,
+          initiatedBy,
+          chatStatus,
+          firstMessageTime: formatTime(getMsgTimestamp(firstMsg)),
+          lastMessageTime: formatTime(getMsgTimestamp(lastMsg)),
+          conversationLog,
+        });
+
+        scanned++;
+        if (scanned % 50 === 0) console.log("Scanned " + scanned + "/" + individualChats.length + "...");
+      } catch (err) {
+        scanned++;
+        console.error("Error scanning " + phone + ":", err.response?.status || err.message);
+      }
+    }
+
+    activeChats.sort((a, b) => b.messageCount - a.messageCount);
+
+    console.log("Insights done: " + activeChats.length + " active chats on " + dateLabel);
+
+    res.json({
+      date: dateLabel,
+      totalScanned: individualChats.length,
+      activeChats: activeChats.length,
+      totalMessages: activeChats.reduce((sum, c) => sum + c.messageCount, 0),
+      chats: activeChats,
+    });
+  } catch (err) {
+    console.error("Insights error:", err.response?.status, err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
 
 // =============================================
 // CHATS: List all WhatsApp chats with summary
@@ -505,5 +635,6 @@ app.listen(PORT, () => {
   console.log("Schedule: Daily at 8:00 AM (Asia/Riyadh)");
   console.log("Manual trigger: GET /run");
   console.log("Chat list: GET /chats");
+  console.log("Insights: GET /insights?date=YYYY-MM-DD");
   console.log("Search: GET /search?phone=XXXXX");
 });

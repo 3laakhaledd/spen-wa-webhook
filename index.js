@@ -81,6 +81,19 @@ function getMessageText(m) {
     "[media]";
 }
 
+// Helper: process batches with concurrency
+async function processBatches(items, concurrency, handler) {
+  const results = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    const batchResults = await Promise.allSettled(batch.map(handler));
+    for (const r of batchResults) {
+      if (r.status === "fulfilled" && r.value) results.push(r.value);
+    }
+  }
+  return results;
+}
+
 // =============================================
 // INSIGHTS: Scan ALL chats for a specific date
 // =============================================
@@ -120,12 +133,11 @@ app.get("/insights", async (req, res) => {
       return jid.includes("@s.whatsapp.net") && !jid.startsWith("status");
     });
 
-    console.log("Scanning " + individualChats.length + " chats for " + dateLabel + "...");
+    console.log("Scanning " + individualChats.length + " chats for " + dateLabel + " (10 concurrent)...");
 
-    const activeChats = [];
     let scanned = 0;
 
-    for (const chat of individualChats) {
+    const activeChats = await processBatches(individualChats, 10, async (chat) => {
       const jid = chat.id || chat.remoteJid;
       const phone = jid.replace("@s.whatsapp.net", "");
       const contactName = chat.name || chat.pushName || phone;
@@ -147,11 +159,10 @@ app.get("/insights", async (req, res) => {
           return msgTime >= targetStart && msgTime < targetEnd;
         });
 
-        if (dayMessages.length === 0) {
-          scanned++;
-          if (scanned % 50 === 0) console.log("Scanned " + scanned + "/" + individualChats.length + "...");
-          continue;
-        }
+        scanned++;
+        if (scanned % 50 === 0) console.log("Scanned " + scanned + "/" + individualChats.length + "...");
+
+        if (dayMessages.length === 0) return null;
 
         dayMessages.sort((a, b) => getMsgTimestamp(a) - getMsgTimestamp(b));
 
@@ -172,7 +183,7 @@ app.get("/insights", async (req, res) => {
           return "[" + time + "] " + direction + ": " + getMessageText(m);
         }).join("\n");
 
-        activeChats.push({
+        return {
           phone,
           contactName,
           messageCount: dayMessages.length,
@@ -183,15 +194,13 @@ app.get("/insights", async (req, res) => {
           firstMessageTime: formatTime(getMsgTimestamp(firstMsg)),
           lastMessageTime: formatTime(getMsgTimestamp(lastMsg)),
           conversationLog,
-        });
-
-        scanned++;
-        if (scanned % 50 === 0) console.log("Scanned " + scanned + "/" + individualChats.length + "...");
+        };
       } catch (err) {
         scanned++;
         console.error("Error scanning " + phone + ":", err.response?.status || err.message);
+        return null;
       }
-    }
+    });
 
     activeChats.sort((a, b) => b.messageCount - a.messageCount);
 

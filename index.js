@@ -28,6 +28,7 @@ app.get("/", (req, res) => res.json({
   endpoints: {
     run: "GET /run - manual daily report",
     search: "GET /search?phone=XXXXX&limit=100 - search WhatsApp chat history",
+    chats: "GET /chats?preview=true&limit=20 - list all chats with optional last-message preview",
   },
 }));
 
@@ -59,16 +60,113 @@ function formatDateTime(epochSec) {
 }
 
 function formatDuration(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
-  return `${h}h ${m}m`;
+  return h + "h " + m + "m";
 }
 
 function getTodayDateStr() {
   return new Date().toLocaleDateString("en-GB", { timeZone: "Asia/Riyadh" });
 }
+
+function getMessageText(m) {
+  return m.message?.conversation ||
+    m.message?.extendedTextMessage?.text ||
+    m.message?.imageMessage?.caption ||
+    m.message?.videoMessage?.caption ||
+    m.message?.documentMessage?.title ||
+    "[media]";
+}
+
+// =============================================
+// CHATS: List all WhatsApp chats with summary
+// =============================================
+app.get("/chats", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const preview = req.query.preview === "true";
+
+    console.log("Listing chats (limit: " + limit + ", preview: " + preview + ")...");
+
+    const chatsRes = await axios.post(
+      EVO_API_URL + "/chat/findChats/" + EVO_INSTANCE,
+      {},
+      { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
+    );
+
+    const allChats = chatsRes.data || [];
+
+    const individualChats = allChats.filter((c) => {
+      const jid = c.id || c.remoteJid || "";
+      return jid.includes("@s.whatsapp.net") && !jid.startsWith("status");
+    });
+
+    const groupChats = allChats.filter((c) => {
+      const jid = c.id || c.remoteJid || "";
+      return jid.includes("@g.us");
+    });
+
+    let chatList = individualChats.map((c) => {
+      const jid = c.id || c.remoteJid || "";
+      const phone = jid.replace("@s.whatsapp.net", "");
+      return {
+        phone,
+        name: c.name || c.pushName || phone,
+        unreadCount: c.unreadCount || 0,
+      };
+    });
+
+    if (preview) {
+      const enrichLimit = Math.min(limit, 30);
+      for (let i = 0; i < Math.min(chatList.length, enrichLimit); i++) {
+        const chat = chatList[i];
+        try {
+          const msgsRes = await axios.post(
+            EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE,
+            {
+              where: { key: { remoteJid: chat.phone + "@s.whatsapp.net" } },
+              limit: 5,
+            },
+            { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
+          );
+
+          const msgs = msgsRes.data?.messages?.records || msgsRes.data?.messages || msgsRes.data || [];
+
+          if (msgs.length > 0) {
+            msgs.sort((a, b) => getMsgTimestamp(b) - getMsgTimestamp(a));
+            const last = msgs[0];
+            const ts = getMsgTimestamp(last);
+            chat.lastMessageTime = formatDateTime(ts);
+            chat.lastMessageTimestamp = ts;
+            chat.lastMessageFrom = last.key?.fromMe ? "You" : chat.name;
+            chat.lastMessageText = getMessageText(last);
+          }
+        } catch (e) {
+          chat.lastMessageText = "[error fetching preview]";
+        }
+      }
+
+      chatList.sort((a, b) => (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0));
+    }
+
+    chatList = chatList.slice(0, limit);
+
+    res.json({
+      totalChats: allChats.length,
+      individualChats: individualChats.length,
+      groupChats: groupChats.length,
+      returned: chatList.length,
+      chats: chatList,
+    });
+
+    console.log("Chats listed: " + chatList.length + " of " + individualChats.length + " individual chats");
+  } catch (err) {
+    console.error("Chats error:", err.response?.status, err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
 
 // =============================================
 // SEARCH: Query WhatsApp chat history by phone
@@ -82,13 +180,12 @@ app.get("/search", async (req, res) => {
       return res.status(400).json({ error: "Missing ?phone= parameter. Usage: /search?phone=966548692404&limit=100" });
     }
 
-    console.log(`Searching WhatsApp history for ${phone} (limit: ${limit})...`);
+    console.log("Searching WhatsApp history for " + phone + " (limit: " + limit + ")...");
 
-    const jid = `${phone}@s.whatsapp.net`;
+    const jid = phone + "@s.whatsapp.net";
 
-    // Fetch messages from Evolution API
     const msgsRes = await axios.post(
-      `${EVO_API_URL}/chat/findMessages/${EVO_INSTANCE}`,
+      EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE,
       {
         where: { key: { remoteJid: jid } },
         limit: limit,
@@ -107,41 +204,30 @@ app.get("/search", async (req, res) => {
       });
     }
 
-    // Sort chronologically
     allMessages.sort((a, b) => getMsgTimestamp(a) - getMsgTimestamp(b));
 
-    // Get contact name from first message
     const contactName = allMessages.find((m) => m.pushName)?.pushName || phone;
 
-    // Format messages
     const formatted = allMessages.map((m) => {
       const ts = getMsgTimestamp(m);
       const isFromMe = m.key?.fromMe || false;
-      const text =
-        m.message?.conversation ||
-        m.message?.extendedTextMessage?.text ||
-        m.message?.imageMessage?.caption ||
-        m.message?.videoMessage?.caption ||
-        m.message?.documentMessage?.title ||
-        "[media]";
       return {
         time: formatDateTime(ts),
         timestamp: ts,
         direction: isFromMe ? "SENT" : "RECEIVED",
         sender: isFromMe ? "You" : contactName,
-        text,
+        text: getMessageText(m),
       };
     });
 
     const sentCount = formatted.filter((m) => m.direction === "SENT").length;
     const receivedCount = formatted.length - sentCount;
 
-    // Group by date
     const byDate = {};
     for (const msg of formatted) {
       const date = formatDate(msg.timestamp);
       if (!byDate[date]) byDate[date] = [];
-      byDate[date].push(`[${msg.time.split(",")[1]?.trim() || msg.time}] ${msg.direction}: ${msg.text}`);
+      byDate[date].push("[" + (msg.time.split(",")[1]?.trim() || msg.time) + "] " + msg.direction + ": " + msg.text);
     }
 
     res.json({
@@ -156,7 +242,7 @@ app.get("/search", async (req, res) => {
       messages: formatted,
     });
 
-    console.log(`Search complete: ${formatted.length} messages for ${phone}`);
+    console.log("Search complete: " + formatted.length + " messages for " + phone);
   } catch (err) {
     console.error("Search error:", err.response?.status, err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data || err.message });
@@ -176,7 +262,7 @@ async function getExistingTaskPhones() {
   const tomorrowMs = todayMs + 86400000;
 
   try {
-    const res = await axios.get(`${CLICKUP_API}/list/${LIST_ID}/task`, {
+    const res = await axios.get(CLICKUP_API + "/list/" + LIST_ID + "/task", {
       headers: { Authorization: CLICKUP_TOKEN },
       params: {
         order_by: "created",
@@ -193,7 +279,7 @@ async function getExistingTaskPhones() {
       if (match) phones.add(match[1]);
     }
 
-    console.log(`Found ${phones.size} existing tasks for today (dedup check)`);
+    console.log("Found " + phones.size + " existing tasks for today (dedup check)");
     return phones;
   } catch (err) {
     console.error("Dedup check failed:", err.response?.status || err.message);
@@ -208,23 +294,23 @@ async function fetchRecentChats() {
   const now = Date.now();
   const since = now - LOOKBACK_MS;
 
-  console.log(`Fetching chats from last ${LOOKBACK_MS / 3600000}h...`);
+  console.log("Fetching chats from last " + (LOOKBACK_MS / 3600000) + "h...");
 
   const chatsRes = await axios.post(
-    `${EVO_API_URL}/chat/findChats/${EVO_INSTANCE}`,
+    EVO_API_URL + "/chat/findChats/" + EVO_INSTANCE,
     {},
     { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
   );
 
   const allChats = chatsRes.data || [];
-  console.log(`Found ${allChats.length} total chats`);
+  console.log("Found " + allChats.length + " total chats");
 
   const individualChats = allChats.filter((c) => {
     const jid = c.id || c.remoteJid || "";
     return jid.includes("@s.whatsapp.net") && !jid.startsWith("status");
   });
 
-  console.log(`${individualChats.length} individual chats found`);
+  console.log(individualChats.length + " individual chats found");
 
   const activeChats = [];
 
@@ -235,7 +321,7 @@ async function fetchRecentChats() {
 
     try {
       const msgsRes = await axios.post(
-        `${EVO_API_URL}/chat/findMessages/${EVO_INSTANCE}`,
+        EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE,
         {
           where: { key: { remoteJid: jid } },
           limit: 500,
@@ -276,16 +362,9 @@ async function fetchRecentChats() {
       const formattedMessages = recentMessages.map((m) => {
         const isFromMe = m.key?.fromMe || false;
         const direction = isFromMe ? "SENT" : "RECEIVED";
-        const text =
-          m.message?.conversation ||
-          m.message?.extendedTextMessage?.text ||
-          m.message?.imageMessage?.caption ||
-          m.message?.videoMessage?.caption ||
-          m.message?.documentMessage?.title ||
-          "[media]";
         const ts = getMsgTimestamp(m);
         const time = formatTime(ts);
-        return `[${time}] ${direction}: ${text}`;
+        return "[" + time + "] " + direction + ": " + getMessageText(m);
       });
 
       const sentCount = recentMessages.filter((m) => m.key?.fromMe).length;
@@ -304,9 +383,9 @@ async function fetchRecentChats() {
         chatStatus,
       });
 
-      console.log(`Chat with ${contactName} (${phone}): ${recentMessages.length} msgs, status: ${chatStatus}`);
+      console.log("Chat with " + contactName + " (" + phone + "): " + recentMessages.length + " msgs, status: " + chatStatus);
     } catch (err) {
-      console.error(`Error fetching messages for ${phone}:`, err.response?.status || err.message);
+      console.error("Error fetching messages for " + phone + ":", err.response?.status || err.message);
     }
   }
 
@@ -337,31 +416,31 @@ async function createDailyInsights() {
 
     for (const chat of chats) {
       if (existingPhones.has(chat.phone)) {
-        console.log(`Skipping ${chat.contactName} (${chat.phone}): task already exists today`);
+        console.log("Skipping " + chat.contactName + " (" + chat.phone + "): task already exists today");
         skipped++;
         continue;
       }
 
       try {
         const descLines = [
-          `**Contact:** ${chat.contactName}`,
-          `**Phone:** ${chat.phone}`,
-          `**Total Messages:** ${chat.messageCount} (Sent: ${chat.sentCount}, Received: ${chat.receivedCount})`,
-          `**Date:** ${dateStr}`,
+          "**Contact:** " + chat.contactName,
+          "**Phone:** " + chat.phone,
+          "**Total Messages:** " + chat.messageCount + " (Sent: " + chat.sentCount + ", Received: " + chat.receivedCount + ")",
+          "**Date:** " + dateStr,
           "",
-          `**First Message:** ${chat.firstCustomerTime ? formatTime(chat.firstCustomerTime) : "N/A"}`,
-          `**Our First Response:** ${chat.firstResponseTime ? formatTime(chat.firstResponseTime) : "No response yet"}`,
-          `**Response Time:** ${chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "N/A"}`,
+          "**First Message:** " + (chat.firstCustomerTime ? formatTime(chat.firstCustomerTime) : "N/A"),
+          "**Our First Response:** " + (chat.firstResponseTime ? formatTime(chat.firstResponseTime) : "No response yet"),
+          "**Response Time:** " + (chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "N/A"),
           "",
-          `**Chat Status:** ${chat.chatStatus === "Open" ? "\ud83d\udd34 Open (awaiting our reply)" : "\ud83d\udfe2 Closed (we replied last)"}`,
+          "**Chat Status:** " + (chat.chatStatus === "Open" ? "\ud83d\udd34 Open (awaiting our reply)" : "\ud83d\udfe2 Closed (we replied last)"),
         ];
 
         const taskStatus = chat.chatStatus === "Open" ? "to do" : "complete";
 
         const taskRes = await axios.post(
-          `${CLICKUP_API}/list/${LIST_ID}/task`,
+          CLICKUP_API + "/list/" + LIST_ID + "/task",
           {
-            name: `${chat.contactName} (${chat.phone}) - ${dateStr}`,
+            name: chat.contactName + " (" + chat.phone + ") - " + dateStr,
             description: descLines.join("\n"),
             status: taskStatus,
           },
@@ -369,8 +448,8 @@ async function createDailyInsights() {
         );
 
         const commentBody = [
-          `**Chat Log: ${chat.contactName} (${chat.phone})**`,
-          `**Messages: ${chat.messageCount}** | **Response Time: ${chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "No response"}** | **Status: ${chat.chatStatus}**`,
+          "**Chat Log: " + chat.contactName + " (" + chat.phone + ")**",
+          "**Messages: " + chat.messageCount + "** | **Response Time: " + (chat.responseDelaySec !== null ? formatDuration(chat.responseDelaySec) : "No response") + "** | **Status: " + chat.chatStatus + "**",
           "",
           "---",
           "",
@@ -378,21 +457,21 @@ async function createDailyInsights() {
         ].join("\n");
 
         await axios.post(
-          `${CLICKUP_API}/task/${taskRes.data.id}/comment`,
+          CLICKUP_API + "/task/" + taskRes.data.id + "/comment",
           { comment_text: commentBody },
           { headers: { Authorization: CLICKUP_TOKEN } }
         );
 
         tasksCreated++;
-        console.log(`Task created: ${chat.contactName} (${chat.phone}) | ${chat.messageCount} msgs | ${chat.chatStatus}`);
+        console.log("Task created: " + chat.contactName + " (" + chat.phone + ") | " + chat.messageCount + " msgs | " + chat.chatStatus);
 
         await new Promise((r) => setTimeout(r, 600));
       } catch (err) {
-        console.error(`Failed to create task for ${chat.phone}:`, err.response?.status, err.response?.data || err.message);
+        console.error("Failed to create task for " + chat.phone + ":", err.response?.status, err.response?.data || err.message);
       }
     }
 
-    console.log(`\nReport complete: ${tasksCreated} created, ${skipped} skipped (already existed).`);
+    console.log("\nReport complete: " + tasksCreated + " created, " + skipped + " skipped (already existed).");
     return { success: true, tasksCreated, skipped, totalChats: chats.length };
   } catch (err) {
     console.error("Insights error:", err.response?.status, err.response?.data || err.message);
@@ -418,12 +497,13 @@ app.get("/run", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`SPEN WA Insights running on port ${PORT}`);
-  console.log(`ClickUp token present: ${!!CLICKUP_TOKEN}`);
-  console.log(`Target list: ${LIST_ID}`);
-  console.log(`Evolution API: ${EVO_API_URL}`);
-  console.log(`Lookback: 24h`);
-  console.log(`Schedule: Daily at 8:00 AM (Asia/Riyadh)`);
-  console.log(`Manual trigger: GET /run`);
-  console.log(`Search: GET /search?phone=XXXXX`);
+  console.log("SPEN WA Insights running on port " + PORT);
+  console.log("ClickUp token present: " + !!CLICKUP_TOKEN);
+  console.log("Target list: " + LIST_ID);
+  console.log("Evolution API: " + EVO_API_URL);
+  console.log("Lookback: 24h");
+  console.log("Schedule: Daily at 8:00 AM (Asia/Riyadh)");
+  console.log("Manual trigger: GET /run");
+  console.log("Chat list: GET /chats");
+  console.log("Search: GET /search?phone=XXXXX");
 });

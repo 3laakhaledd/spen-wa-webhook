@@ -14,8 +14,11 @@ function source(data, calls = []) {
     calls.push(q);
     assert.equal(q.offset, 500);
     assert.equal(q.take, undefined);
-    return { messages: { total: data.length, pages: Math.ceil(data.length / q.offset),
-      currentPage: q.page, records: data.slice((q.page - 1) * q.offset, q.page * q.offset) } };
+    const f = q.where.messageTimestamp;
+    const subset = f ? data.filter(m => m.messageTimestamp >= Date.parse(f.gte) / 1000 &&
+      m.messageTimestamp <= Date.parse(f.lte) / 1000) : data;
+    return { messages: { total: subset.length, pages: Math.ceil(subset.length / q.offset),
+      currentPage: q.page, records: subset.slice((q.page - 1) * q.offset, q.page * q.offset) } };
   };
 }
 test("Riyadh date bounds are exact and invalid dates rejected", () => {
@@ -23,13 +26,14 @@ test("Riyadh date bounds are exact and invalid dates rejected", () => {
   assert.equal(new Date(b.end * 1000).toISOString(), "2026-09-21T21:00:00.000Z");
   assert.throws(() => dayBounds("2026-02-30"));
 });
-test("1001 records cover 3 pages and exhaustion twice", async () => {
+test("1001 records cover disjoint windows and exhaustion twice", async () => {
   const calls = [];
   const r = await verifiedCollect(source(rows(1001), calls), {}, b);
   assert.equal(r.coverage.complete, true);
   assert.equal(r.coverage.sourceTotal, 1001);
   assert.equal(r.coverage.passesVerified, 2);
-  assert.deepEqual(calls.map(q => q.page), [1, 2, 3, 4, 1, 2, 3, 4]);
+  assert.ok(calls.every(q => q.page <= 2));
+  assert.ok(r.coverage.passes.every(p => p.windows > 1 && p.exhaustionVerified));
 });
 test("zero is verified, not inferred from a failure", async () => {
   const r = await verifiedCollect(source([]), {}, b);
@@ -69,7 +73,7 @@ test("different second-pass IDs invalidate report", async () => {
   const data = rows(1);
   await assert.rejects(() => verifiedCollect(async q => {
     requests++;
-    return source(requests > 2 ? [{ ...data[0], id: "changed" }] : data)(q);
+    return source(requests > 3 ? [{ ...data[0], id: "changed" }] : data)(q);
   }, {}, b), /Verification pass differed/);
 });
 test("database ID never overrides remoteJid and all JID types count", () => {
@@ -85,4 +89,27 @@ test("database ID never overrides remoteJid and all JID types count", () => {
 test("wrapped text is extracted without claiming to transcribe media", () => {
   assert.equal(textOf({ message: { ephemeralMessage: { message: { conversation: "hello" } } } }), "hello");
   assert.equal(textOf({ message: { audioMessage: {} } }), "[media or non-text]");
+});
+
+test("timestamp ties cannot create duplicate pages in windowed retrieval", async () => {
+  const data = rows(844).map((m, i) => ({ ...m, messageTimestamp: b.start + Math.floor(i / 100) }));
+  const filtered = source(data);
+  const r = await verifiedCollect(async q => {
+    const result = await filtered(q);
+    if (q.page > 1 && result.messages.total > 500)
+      result.messages.records = data.slice(0, result.messages.records.length);
+    return result;
+  }, {}, b);
+  assert.equal(r.rows.length, 844);
+  assert.equal(r.coverage.passes[0].sha256, r.coverage.passes[1].sha256);
+});
+test("overfull single-second window still fails on unstable pagination", async () => {
+  const data = rows(700).map(m => ({ ...m, messageTimestamp: b.start }));
+  const filtered = source(data);
+  await assert.rejects(() => verifiedCollect(async q => {
+    const result = await filtered(q);
+    if (q.page > 1 && result.messages.total > 500)
+      result.messages.records = data.slice(0, result.messages.records.length);
+    return result;
+  }, {}, b), /Duplicate/);
 });

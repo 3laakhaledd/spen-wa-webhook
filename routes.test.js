@@ -40,7 +40,7 @@ test("background report verifies every page, preserves LIDs and returns safe ide
   const final = await h.call("/insights");
   assert.equal(final.status, "complete");
   assert.equal(final.coverage.passesVerified, 2);
-  assert.equal(h.reads(), 4);
+  assert.equal(h.reads(), 6);
   assert.equal(final.summary.totalMessages, 1);
   assert.equal(final.chats[0].kind, "individual_lid");
   assert.equal(final.pagination.nextOffset, null);

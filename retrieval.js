@@ -1,7 +1,8 @@
 // Evolution 2.3.7 fetchMessages uses offset (page size) and page (1-based).
 // Validate source totals and exhaust pagination twice; never equate an error with zero.
 const crypto = require("node:crypto");
-const VERSION = "verified-pages-v3";
+const VERSION = "verified-windows-v4";
+const windowed = require("./windowed");
 const PAGE_SIZE = 500;
 function timestamp(m) {
   const v = m.messageTimestamp;
@@ -99,8 +100,8 @@ async function collectPass(readPage, where, bounds, progress = () => {}) {
     exhaustionVerified: true, sha256: digest(rows), receipts } };
 }
 async function verifiedCollect(readPage, where, bounds, progress = () => {}) {
-  const a = await collectPass(readPage, where, bounds, p => progress({ pass: 1, ...p }));
-  const b = await collectPass(readPage, where, bounds, p => progress({ pass: 2, ...p }));
+  const a = await windowed(readPage, where, bounds, p => progress({ pass: 1, ...p }), collectPass, digest);
+  const b = await windowed(readPage, where, bounds, p => progress({ pass: 2, ...p }), collectPass, digest);
   if (a.audit.total !== b.audit.total || a.audit.sha256 !== b.audit.sha256)
     throw new Error("Verification pass differed; report is not complete");
   return { rows: b.rows, coverage: { complete: true, scope: "stored Evolution messages matching the query",
@@ -168,7 +169,8 @@ function install(app, { axios, baseUrl, apiKey, instance }) {
   function ensureJob(date) {
     const bounds = dayBounds(date);
     const existing = jobs.get(date);
-    if (existing && (existing.status === "running" || Date.now() - existing.created < 600000)) return existing;
+    if (existing && (existing.status === "running" ||
+        Date.now() - existing.created < (existing.status === "failed" ? 30000 : 600000))) return existing;
     if ([...jobs.values()].some(j => j.status === "running"))
       throw new Error("Another date is being verified; retry when it completes");
     for (const [k, v] of jobs) if (Date.now() - v.created >= 600000) jobs.delete(k);
@@ -213,7 +215,11 @@ function install(app, { axios, baseUrl, apiKey, instance }) {
         direction: m.key.fromMe ? "sent" : "received", text: textOf(m), messageType: m.messageType
       })) : page.map(({ records, ...c }) => ({
         ...c, preview: records.slice(0, 3).map(m => ({ direction: m.key.fromMe ? "sent" : "received", text: textOf(m) })),
-        messageIds: req.query.lite === "false" ? records.map(m => m.id) : undefined
+        messageIds: req.query.lite === "false" ? records.map(m => m.id) : undefined,
+        transcript: req.query.transcript === "true" ? records.map(m => ({
+          id: m.id, timestamp: timestamp(m), direction: m.key.fromMe ? "sent" : "received",
+          text: textOf(m), messageType: m.messageType
+        })) : undefined
       }));
       return res.json({ ...base, coverage, identity: job.identity, window: job.window, summary: job.summary,
         pagination: { offset, limit, total: source.length, returned: page.length,
@@ -224,7 +230,7 @@ function install(app, { axios, baseUrl, apiKey, instance }) {
   app.get("/insights", (req, res) => respond(req, res));
   app.get("/insights/records", (req, res) => respond(req, res, true));
   app.get("/retrieval-health", (req, res) => res.json({ version: VERSION, pagination: "offset/page",
-    verification: "two full passes plus empty terminal pages", instance }));
+    verification: "two disjoint-time-window passes plus empty terminal pages", instance }));
   app.get("/search", async (req, res) => {
     try {
       // phone selects a CONTACT, never the connected account.

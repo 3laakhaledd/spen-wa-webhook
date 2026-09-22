@@ -70,14 +70,14 @@ async function processBatches(items, concurrency, handler) {
 
 // =============================================
 // INSIGHTS: Scan ALL chats for a specific date
-// ?lite=true  -> fast mode (20 concurrent, no logs, limit 50 msgs)
-// ?lite=false -> full mode (10 concurrent, with logs, limit 500 msgs)
+// ?lite=true  -> fast mode (20 concurrent, no logs, take 50 msgs)
+// ?lite=false -> full mode (10 concurrent, with logs, take 500 msgs)
 // =============================================
 app.get("/insights", async (req, res) => {
   try {
     const lite = req.query.lite !== "false";
     const concurrency = lite ? 20 : 10;
-    const msgLimit = lite ? 50 : 500;
+    const msgTake = lite ? 50 : 500;
     const riyadhOffset = 3 * 60 * 60 * 1000;
     let targetStart, targetEnd, dateLabel;
 
@@ -123,7 +123,7 @@ app.get("/insights", async (req, res) => {
       try {
         const msgsRes = await axios.post(
           EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE,
-          { where: { key: { remoteJid: jid } }, limit: msgLimit },
+          { where: { key: { remoteJid: jid } }, take: msgTake },
           { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } }
         );
 
@@ -205,7 +205,7 @@ app.get("/chats", async (req, res) => {
       for (let i = 0; i < Math.min(chatList.length, enrichLimit); i++) {
         const chat = chatList[i];
         try {
-          const msgsRes = await axios.post(EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE, { where: { key: { remoteJid: chat.phone + "@s.whatsapp.net" } }, limit: 5 }, { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } });
+          const msgsRes = await axios.post(EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE, { where: { key: { remoteJid: chat.phone + "@s.whatsapp.net" } }, take: 5 }, { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } });
           const msgs = msgsRes.data?.messages?.records || msgsRes.data?.messages || msgsRes.data || [];
           if (msgs.length > 0) { msgs.sort((a, b) => getMsgTimestamp(b) - getMsgTimestamp(a)); const last = msgs[0]; const ts = getMsgTimestamp(last); chat.lastMessageTime = formatDateTime(ts); chat.lastMessageTimestamp = ts; chat.lastMessageFrom = last.key?.fromMe ? "You" : chat.name; chat.lastMessageText = getMessageText(last); }
         } catch (e) { chat.lastMessageText = "[error]"; }
@@ -220,10 +220,10 @@ app.get("/chats", async (req, res) => {
 app.get("/search", async (req, res) => {
   try {
     const phone = req.query.phone;
-    const limit = parseInt(req.query.limit) || 200;
+    const take = parseInt(req.query.limit) || 500;
     if (!phone) return res.status(400).json({ error: "Missing ?phone= parameter" });
     const jid = phone + "@s.whatsapp.net";
-    const msgsRes = await axios.post(EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE, { where: { key: { remoteJid: jid } }, limit: limit }, { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } });
+    const msgsRes = await axios.post(EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE, { where: { key: { remoteJid: jid } }, take: take }, { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } });
     const allMessages = msgsRes.data?.messages?.records || msgsRes.data?.messages || msgsRes.data || [];
     if (allMessages.length === 0) return res.json({ phone, totalMessages: 0, note: "No messages found.", messages: [] });
     allMessages.sort((a, b) => getMsgTimestamp(a) - getMsgTimestamp(b));
@@ -250,7 +250,7 @@ async function fetchRecentChats() {
   for (const chat of individualChats) {
     const jid = chat.id || chat.remoteJid; const phone = jid.replace("@s.whatsapp.net", ""); const contactName = chat.name || chat.pushName || phone;
     try {
-      const msgsRes = await axios.post(EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE, { where: { key: { remoteJid: jid } }, limit: 500 }, { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } });
+      const msgsRes = await axios.post(EVO_API_URL + "/chat/findMessages/" + EVO_INSTANCE, { where: { key: { remoteJid: jid } }, take: 500 }, { headers: { apikey: EVO_API_KEY, "Content-Type": "application/json" } });
       const allMessages = msgsRes.data?.messages?.records || msgsRes.data?.messages || msgsRes.data || [];
       const recentMessages = allMessages.filter((m) => { const msgTime = getMsgTimestamp(m) * 1000; return msgTime >= since; });
       if (recentMessages.length === 0) continue;

@@ -21,6 +21,8 @@ app.get("/", (req, res) => res.json({
     records: "GET /insights/records?date=YYYY-MM-DD&offset=0&limit=200",
     chats: "GET /chats?preview=true&offset=0&limit=50",
     search: "GET /search?phone=CONTACT_NUMBER&offset=0&limit=200",
+    groups: "GET /groups?name=Grade (member counts only)",
+    groupMembers: "GET /groups/members?name=Grade 5 (counts here; numbers go to the private ClickUp WhatsApp task)",
     health: "GET /retrieval-health",
     run: "GET /run (legacy ClickUp task creation; NOT a read-only report)"
   }
@@ -115,4 +117,72 @@ async function createDailyInsights() {
 }
 cron.schedule("0 5 * * *", () => { createDailyInsights(); }, { timezone: "Asia/Riyadh" });
 app.get("/run", async (req, res) => res.json(await createDailyInsights()));
+// Read-only group roster counts. This service is public, so participant numbers are NEVER returned.
+app.get("/groups", async (req, res) => {
+  try {
+    const r = await axios.get(EVO_API_URL.replace(/\/$/, "") + "/group/fetchAllGroups/" + encodeURIComponent(EVO_INSTANCE),
+      { headers: { apikey: EVO_API_KEY }, params: { getParticipants: "true" }, timeout: 120000 });
+    if (!Array.isArray(r.data)) throw new Error("Unexpected group-list response");
+    const q = String(req.query.name || "").toLowerCase().replace(/\s+/g, "");
+    const groups = r.data.map(g => {
+      const parts = Array.isArray(g.participants) ? g.participants : null;
+      return {
+        jid: g.id, name: g.subject || g.id,
+        participants: parts ? parts.length : (Number.isInteger(g.size) ? g.size : null),
+        admins: parts ? parts.filter(p => p.admin === "admin" || p.admin === "superadmin").length : null,
+        reportedSize: Number.isInteger(g.size) ? g.size : null,
+        source: parts ? "participant list" : "size field"
+      };
+    }).filter(g => !q || String(g.name).toLowerCase().replace(/\s+/g, "").includes(q))
+      .sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true }));
+    res.set("Cache-Control", "no-store");
+    res.json({ instance: EVO_INSTANCE, totalGroups: groups.length,
+      note: "Counts only; participant numbers are never returned. Counts include the connected account itself.",
+      groups });
+  } catch (e) {
+    res.status(502).json({ error: "Group retrieval failed" + (e.response?.status ? " (HTTP " + e.response.status + ")" : "") });
+  }
+});
+
+// Member numbers are PII: never returned over this public URL. They are posted as a
+// comment on the private ClickUp WhatsApp task instead; the HTTP response carries counts only.
+const MEMBERS_TASK_ID = process.env.MEMBERS_TASK_ID || "86eyxa3c8";
+const memberNumber = p => {
+  const pick = [p.phoneNumber, p.jid, p.id].find(v => typeof v === "string" && v.endsWith("@s.whatsapp.net"));
+  return pick ? "+" + pick.split("@")[0].split(":")[0] : null;
+};
+app.get("/groups/members", async (req, res) => {
+  try {
+    const q = String(req.query.name || "").toLowerCase().replace(/\s+/g, "");
+    if (q.length < 2) throw Object.assign(new Error("Supply ?name= (at least 2 characters)"), { client: true });
+    const r = await axios.get(EVO_API_URL.replace(/\/$/, "") + "/group/fetchAllGroups/" + encodeURIComponent(EVO_INSTANCE),
+      { headers: { apikey: EVO_API_KEY }, params: { getParticipants: "true" }, timeout: 120000 });
+    if (!Array.isArray(r.data)) throw new Error("Unexpected group-list response");
+    const groups = r.data.filter(g => String(g.subject || "").toLowerCase().replace(/\s+/g, "").includes(q))
+      .sort((a, b) => String(a.subject).localeCompare(String(b.subject), undefined, { numeric: true }));
+    if (groups.length > 15) throw Object.assign(new Error("Too many groups match (" + groups.length + "); narrow ?name="), { client: true });
+    const summary = [];
+    for (const g of groups) {
+      const parts = Array.isArray(g.participants) ? g.participants : [];
+      const rows = parts.map(p => ({ number: memberNumber(p), lid: String(p.id || "").endsWith("@lid") ? p.id : null,
+        admin: p.admin === "admin" || p.admin === "superadmin" }));
+      const withNumber = rows.filter(x => x.number);
+      const lines = rows.map((x, i) => (i + 1) + ". " + (x.number || ("hidden number (" + x.lid + ")")) + (x.admin ? " [admin]" : ""));
+      await axios.post(CLICKUP_API + "/task/" + MEMBERS_TASK_ID + "/comment",
+        { comment_text: "WA group members: " + (g.subject || g.id) + "\nTotal members: " + rows.length +
+          " | with visible number: " + withNumber.length + "\nPulled: " + new Date().toISOString() + "\n\n" + lines.join("\n") },
+        { headers: { Authorization: CLICKUP_TOKEN }, timeout: 30000 });
+      summary.push({ name: g.subject || g.id, members: rows.length, withVisibleNumber: withNumber.length,
+        hiddenLidOnly: rows.length - withNumber.length });
+      await new Promise(r => setTimeout(r, 600));
+    }
+    res.set("Cache-Control", "no-store");
+    res.json({ instance: EVO_INSTANCE, matchedGroups: summary.length,
+      note: "Numbers posted to the private ClickUp WhatsApp task; not returned here.", groups: summary });
+  } catch (e) {
+    res.status(e.client ? 400 : 502).json({ error: e.client ? e.message :
+      "Member export failed" + (e.response?.status ? " (HTTP " + e.response.status + ")" : "") });
+  }
+});
+
 app.listen(PORT, () => console.log("SPEN WA Insights " + retrieval.VERSION + " on port " + PORT));

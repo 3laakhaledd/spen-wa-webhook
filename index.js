@@ -22,7 +22,7 @@ app.get("/", (req, res) => res.json({
     chats: "GET /chats?preview=true&offset=0&limit=50",
     search: "GET /search?phone=CONTACT_NUMBER&offset=0&limit=200",
     groups: "GET /groups?name=Grade (member counts only)",
-    groupMembers: "GET /groups/members?name=Grade 5 (counts here; numbers go to the private ClickUp WhatsApp task)",
+    groupMembers: "GET /groups/members?name=Grade 5 (counts here; numbers go to the private ClickUp WhatsApp list)",
     health: "GET /retrieval-health",
     run: "GET /run (legacy ClickUp task creation; NOT a read-only report)"
   }
@@ -145,8 +145,8 @@ app.get("/groups", async (req, res) => {
 });
 
 // Member numbers are PII: never returned over this public URL. They are posted as a
-// comment on the private ClickUp WhatsApp task instead; the HTTP response carries counts only.
-const MEMBERS_TASK_ID = process.env.MEMBERS_TASK_ID || "86eyxa3c8";
+// task in the private ClickUp WhatsApp list instead; the HTTP response carries counts only.
+const MEMBERS_LIST_ID = process.env.MEMBERS_LIST_ID || LIST_ID;
 const memberNumber = p => {
   const pick = [p.phoneNumber, p.jid, p.id].find(v => typeof v === "string" && v.endsWith("@s.whatsapp.net"));
   return pick ? "+" + pick.split("@")[0].split(":")[0] : null;
@@ -168,19 +168,27 @@ app.get("/groups/members", async (req, res) => {
         admin: p.admin === "admin" || p.admin === "superadmin" }));
       const withNumber = rows.filter(x => x.number);
       const lines = rows.map((x, i) => (i + 1) + ". " + (x.number || ("hidden number (" + x.lid + ")")) + (x.admin ? " [admin]" : ""));
-      await axios.post(CLICKUP_API + "/task/" + MEMBERS_TASK_ID + "/comment",
-        { comment_text: "WA group members: " + (g.subject || g.id) + "\nTotal members: " + rows.length +
-          " | with visible number: " + withNumber.length + "\nPulled: " + new Date().toISOString() + "\n\n" + lines.join("\n") },
-        { headers: { Authorization: CLICKUP_TOKEN }, timeout: 30000 });
+      const body = "Total members: " + rows.length + " | with visible number: " + withNumber.length +
+        "\nPulled: " + new Date().toISOString() + "\n\n" + lines.join("\n");
+      try {
+        // Private ClickUp list the service already writes to (same token as the daily run).
+        await axios.post(CLICKUP_API + "/list/" + MEMBERS_LIST_ID + "/task",
+          { name: "WA group members: " + (g.subject || g.id) + " (" + new Date().toISOString().slice(0, 10) + ")",
+            description: body },
+          { headers: { Authorization: CLICKUP_TOKEN }, timeout: 30000 });
+      } catch (e) {
+        throw Object.assign(new Error("ClickUp write failed" + (e.response?.status ? " (HTTP " + e.response.status + ")" : "") +
+          (CLICKUP_TOKEN ? "" : " - CLICKUP_API_TOKEN not set")), { client: false, safe: true });
+      }
       summary.push({ name: g.subject || g.id, members: rows.length, withVisibleNumber: withNumber.length,
         hiddenLidOnly: rows.length - withNumber.length });
       await new Promise(r => setTimeout(r, 600));
     }
     res.set("Cache-Control", "no-store");
     res.json({ instance: EVO_INSTANCE, matchedGroups: summary.length,
-      note: "Numbers posted to the private ClickUp WhatsApp task; not returned here.", groups: summary });
+      note: "Numbers saved as tasks in the private ClickUp WhatsApp list; not returned here.", groups: summary });
   } catch (e) {
-    res.status(e.client ? 400 : 502).json({ error: e.client ? e.message :
+    res.status(e.client ? 400 : e.safe ? 200 : 502).json({ ok: false, error: (e.client || e.safe) ? e.message :
       "Member export failed" + (e.response?.status ? " (HTTP " + e.response.status + ")" : "") });
   }
 });

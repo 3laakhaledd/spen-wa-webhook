@@ -5,8 +5,9 @@ const SKIP = new Set(["reactionMessage", "protocolMessage", "secretEncryptedMess
   "editedMessage", "pollUpdateMessage", "senderKeyDistributionMessage", "messageContextInfo", "keepInChatMessage"]);
 const CLOSER = /^(?:\s|شكرا|شكراً|مشكور[ةه]?|يعطيك?\s*العافي[ةه]|جزاك[مي]?\s*الله\s*خير[اً]*|تمام|طيب|اوك|أوك|ok|okay|thanks?|thank you|تسلم[يو]?|الله يسعدك|ماشي|حاضر|خلاص|وصلت?|[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u2764\uFE0F👍🙏🌹🌷❤]+|[.!؟?]+)+$/iu;
 const ts = m => Number(m.messageTimestamp && typeof m.messageTimestamp === "object" ? m.messageTimestamp.low : m.messageTimestamp);
+const NUM_TOKEN_SHA = "b63ee96c68cfd1190e0f5bf8f040efa9adbd7575f616ead2c71c0b47db1fc1ef";
 const riyadh = sec => new Date((sec + 10800) * 1000);
-function install(app, apiFor, lines) {
+function install(app, apiFor, lines, fetchGroups) {
   const jobs = new Map();
   const handler = async (req, res) => {
     res.set("Cache-Control", "no-store");
@@ -38,6 +39,8 @@ function install(app, apiFor, lines) {
               if (!threads.has(jid)) threads.set(jid, { jid, name: null, msgs: [] });
               const t = threads.get(jid);
               if (!m.key.fromMe && m.pushName) t.name = m.pushName;
+              if (!t.pn) t.pn = jid.endsWith("@s.whatsapp.net") ? jid : [m.key.remoteJidAlt, m.key.senderPn, m.key.participantPn, m.remoteJidAlt, m.key.previousRemoteJid]
+                .find(v => typeof v === "string" && v.endsWith("@s.whatsapp.net")) || null;
               t.msgs.push(m);
             }
             const inWin = sec => sec >= s && sec < e && days.includes(riyadh(sec).getUTCDay());
@@ -68,7 +71,7 @@ function install(app, apiFor, lines) {
               });
               if (!kept.length && !outC) continue;
               const firstOut = t.msgs.find(m => inWin(ts(m)));
-              rows.push({ jid: t.jid, name: t.name || "", in: inC, out: outC,
+              rows.push({ jid: t.jid, pn: t.pn, name: t.name || "", in: inC, out: outC,
                 startedBy: firstOut ? (firstOut.key.fromMe ? "school" : "customer") : null, b: kept, t: texts });
             }
             rows.sort((a, b) => (b.in + b.out) - (a.in + a.out) || a.jid.localeCompare(b.jid));
@@ -78,11 +81,12 @@ function install(app, apiFor, lines) {
         })();
       }
       if (job.status !== "complete") return res.json({ status: job.status, error: job.error, note: "poll again" });
+      if (req.query.numbers) return res.json(await numbers(job, req.query, instance));
       if (req.query.cls) return res.json(summarize(job, req.query, s, e));
       const offset = Math.max(0, Number(req.query.offset) || 0), limit = Math.min(100, Math.max(1, Number(req.query.limit) || 40));
       res.json({ status: "complete", instance, window: job.window, coverage: job.coverage, totalThreads: job.rows.length,
         offset, nextOffset: offset + limit < job.rows.length ? offset + limit : null,
-        legend: "b=[[burstStartSec, firstReplySec|null, inboundMsgs, closerOnly]]", rows: job.rows.slice(offset, offset + limit).map((r, i) => req.query.lite ? { i: offset + i, name: r.name, in: r.in, out: r.out, by: r.startedBy, t: r.t } : r) });
+        legend: "b=[[burstStartSec, firstReplySec|null, inboundMsgs, closerOnly]]", rows: job.rows.slice(offset, offset + limit).map((r, i) => req.query.lite ? { i: offset + i, name: r.name, in: r.in, out: r.out, by: r.startedBy, t: r.t } : { ...r, pn: undefined }) });
     } catch (err) { res.status(400).json({ status: "failed", error: err.message }); }
   };
   app.get("/report/week", handler);
@@ -91,6 +95,48 @@ function install(app, apiFor, lines) {
     req.query = { ...req.query, cls: req.params.cls.replace(/Q/g, "?"), cat: req.params.cat, cmp: req.params.cmp.replace(/_/g, "-") };
     return handler(req, res);
   });
+  // Phone numbers are PII: only behind a secret path token (sha256 checked), never on the open routes.
+  app.get("/report/week/n/:token/:cls/:cat", (req, res) => {
+    const h = require("node:crypto").createHash("sha256").update(String(req.params.token)).digest("hex");
+    if (h !== NUM_TOKEN_SHA) return res.status(403).json({ error: "forbidden" });
+    req.query = { ...req.query, numbers: "1", cls: req.params.cls.replace(/Q/g, "?"), cat: req.params.cat };
+    return handler(req, res);
+  });
+  const dayOf = sec => riyadh(sec).toISOString().slice(0, 10);
+  async function numbers(job, q, instance) {
+    const cls = String(q.cls), cat = String(q.cat || ""), keep = new Set(String(q.keep || "PN").split(""));
+    const pendingFrom = Number(q.pendingFrom || 0);
+    const lidMap = new Map();
+    try {
+      for (const g of await fetchGroups(instance)) for (const p of (g.participants || [])) {
+        const pn = [p.phoneNumber, p.jid].find(v => typeof v === "string" && v.endsWith("@s.whatsapp.net"));
+        if (pn && typeof p.id === "string" && p.id.endsWith("@lid")) lidMap.set(p.id, pn);
+        if (pn && typeof p.lid === "string") lidMap.set(p.lid, pn);
+      }
+    } catch (e) { /* groups optional */ }
+    const fmt = j => j ? "+" + j.split("@")[0].split(":")[0] : null;
+    const list = [];
+    job.rows.forEach((r, i) => {
+      if (!keep.has(cls[i] || "?")) return;
+      const number = fmt(r.pn || lidMap.get(r.jid));
+      const real = r.b.filter(b => !b[3]);
+      for (const [bs, br, n] of real) {
+        const same = br && dayOf(br) === dayOf(bs);
+        if (same) continue;
+        const otherDay = real.some(x => x[1] && dayOf(x[1]) !== dayOf(bs));
+        list.push({ i, name: r.name, number, numberSource: r.pn ? "chat" : lidMap.has(r.jid) ? "group roster" : "hidden (WhatsApp privacy ID)",
+          seg: cls[i], cat: cat[i] || "O", at: riyadh(bs).toISOString().slice(0, 16).replace("T", " "), msgs: n,
+          status: br ? "replied another day" : (pendingFrom && bs >= pendingFrom ? "pending (Thu after hours)" : "never replied"),
+          repliedAt: br ? riyadh(br).toISOString().slice(0, 16).replace("T", " ") : null,
+          waitHours: br ? +((br - bs) / 3600).toFixed(1) : null,
+          schoolRepliedThisNumberOnOtherDays: otherDay });
+      }
+    });
+    list.sort((a, b) => a.at.localeCompare(b.at));
+    return { count: list.length, neverReplied: list.filter(x => x.status === "never replied").length,
+      repliedAnotherDay: list.filter(x => x.status === "replied another day").length,
+      pending: list.filter(x => x.status.startsWith("pending")).length, items: list };
+  }
 }
 
 // Working hours (Riyadh): Sun-Thu, OPEN-CLOSE. Business seconds between two instants.

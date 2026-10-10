@@ -30,7 +30,7 @@ LINES.forEach((name, i) => {
 app.use("/line/1", (req, res) => res.redirect(307, req.originalUrl.replace(/^\/line\/1/, "") || "/"));
 const lines = linesLib.create({ ...evoOpts, lines: LINES, connectKey: process.env.CONNECT_KEY || "" });
 lines.install(app);
-require("./report").install(app, name => apis.get(name), LINES);
+require("./report").install(app, name => apis.get(name), LINES, instance => fetchGroups(instance));
 // ?line=2 or ?instance=spen-whatsapp-2 selects a number; default is line 1.
 function pickInstance(req) {
   const n = Number(req.query.line);

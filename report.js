@@ -8,7 +8,7 @@ const ts = m => Number(m.messageTimestamp && typeof m.messageTimestamp === "obje
 const riyadh = sec => new Date((sec + 10800) * 1000);
 function install(app, apiFor, lines) {
   const jobs = new Map();
-  app.get("/report/week", async (req, res) => {
+  const handler = async (req, res) => {
     res.set("Cache-Control", "no-store");
     try {
       const n = Number(req.query.line || 1);
@@ -84,6 +84,12 @@ function install(app, apiFor, lines) {
         offset, nextOffset: offset + limit < job.rows.length ? offset + limit : null,
         legend: "b=[[burstStartSec, firstReplySec|null, inboundMsgs, closerOnly]]", rows: job.rows.slice(offset, offset + limit).map((r, i) => req.query.lite ? { i: offset + i, name: r.name, in: r.in, out: r.out, by: r.startedBy, t: r.t } : r) });
     } catch (err) { res.status(400).json({ status: "failed", error: err.message }); }
+  };
+  app.get("/report/week", handler);
+  // Classification in the path (some fetchers strip long query params). Q = unknown, _ = no complaint.
+  app.get("/report/week/k/:cls/:cat/:cmp", (req, res) => {
+    req.query = { ...req.query, cls: req.params.cls.replace(/Q/g, "?"), cat: req.params.cat, cmp: req.params.cmp.replace(/_/g, "-") };
+    return handler(req, res);
   });
 }
 

@@ -30,6 +30,7 @@ LINES.forEach((name, i) => {
 app.use("/line/1", (req, res) => res.redirect(307, req.originalUrl.replace(/^\/line\/1/, "") || "/"));
 const lines = linesLib.create({ ...evoOpts, lines: LINES, connectKey: process.env.CONNECT_KEY || "" });
 lines.install(app);
+require("./report").install(app, name => apis.get(name), LINES);
 // ?line=2 or ?instance=spen-whatsapp-2 selects a number; default is line 1.
 function pickInstance(req) {
   const n = Number(req.query.line);
@@ -43,6 +44,7 @@ app.get("/", (req, res) => res.json({
   status: "ok", service: "spen-wa-insights", version: retrieval.VERSION,
   lines: LINES.map((name, i) => ({ line: i + 1, instance: name })),
   endpoints: {
+    weekReport: "GET /report/week?from=YYYY-MM-DD&to=YYYY-MM-DD&days=0,1,2,3,4&line=N (individual customer chats, compact)",
     connect: "GET /connect (QR / pairing codes for every line)",
     lines: "GET /lines (connection status of every line)",
     insights: "GET /insights?date=YYYY-MM-DD&offset=0&limit=50&audit=true (line 1; /line/N/insights for others)",
